@@ -68,7 +68,7 @@ if not OPENAI_API_KEY:
 
 # LangChain OpenAI chat model pointing at AI Pipe
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL", "gpt-4.1-nano"),  # or "gpt-4o-mini"
+    model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
     temperature=0,
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
