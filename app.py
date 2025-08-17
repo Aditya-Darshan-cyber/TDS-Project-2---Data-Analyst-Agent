@@ -49,6 +49,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
+# ---- CORS (needed if prof site calls from browser) ----
 from fastapi.middleware.cors import CORSMiddleware
 app.add_middleware(
     CORSMiddleware,
@@ -77,7 +78,7 @@ if not OPENAI_API_KEY:
 
 # LangChain OpenAI chat model pointing at AI Pipe
 llm = ChatOpenAI(
-    model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+    model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),  # <- default to gpt-5-mini
     temperature=0,
     api_key=OPENAI_API_KEY,
     base_url=OPENAI_BASE_URL,
@@ -415,7 +416,6 @@ def plot_to_base64(max_bytes=100000):
 # -----------------------------
 # LLM agent setup
 # -----------------------------
-# (Removed old Gemini init)
 # Use the ChatOpenAI `llm` defined above.
 
 # Tools list for agent (LangChain tool decorator returns metadata for the LLM)
@@ -474,8 +474,10 @@ def run_agent_safely(llm_input: str) -> Dict:
     4. Execute the code in a temp file and return results mapping questions -> answers
     """
     try:
+        logger.info("Invoking agent with input length=%d", len(llm_input or ""))
         response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
         raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
+        logger.info("Agent raw_out bytes=%d", len(raw_out.encode("utf-8")) if raw_out else 0)
         if not raw_out:
             return {"error": f"Agent returned no output. Full response: {response}"}
 
@@ -525,7 +527,10 @@ def run_agent_safely(llm_input: str) -> Dict:
 
 from fastapi import Request
 
+# --- Accept POST on "/", "/api", and "/api/" (prevents 405 on prof portal) ---
+@app.post("/")
 @app.post("/api")
+@app.post("/api/")
 async def analyze_data(request: Request):
     try:
         form = await request.form()
@@ -669,6 +674,7 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
         max_retries = 3
         raw_out = ""
         for attempt in range(1, max_retries + 1):
+            logger.info("Agent attempt %d/%d", attempt, max_retries)
             response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
             raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
             if raw_out:
@@ -730,12 +736,14 @@ async def favicon():
         return FileResponse(path, media_type="image/x-icon")
     return Response(content=_FAVICON_FALLBACK_PNG, media_type="image/png")
 
+# Health/info — allow both /api and /api/ to avoid redirects
 @app.get("/api", include_in_schema=False)
+@app.get("/api/", include_in_schema=False)
 async def analyze_get_info():
-    """Health/info endpoint. Use POST /api for actual analysis."""
+    """Health/info endpoint. Use POST / (or /api) for actual analysis."""
     return JSONResponse({
         "ok": True,
-        "message": "Server is running. Use POST /api with 'questions_file' and optional 'data_file'.",
+        "message": "Server is running. Use POST / or /api with 'questions_file' and optional 'data_file'.",
     })
 
 
