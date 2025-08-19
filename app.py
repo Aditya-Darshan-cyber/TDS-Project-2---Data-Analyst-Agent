@@ -555,7 +555,8 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "import matplotlib.pyplot as plt",
         "from io import BytesIO",
         "import base64",
-        "import seaborn as sns",
+        # Avoid hard seaborn dependency in the sandbox
+        "try:\n    import seaborn as sns\nexcept Exception:\n    sns = None",
     ]
     if PIL_READY:
         bootstrap_lines.append("from PIL import Image")
