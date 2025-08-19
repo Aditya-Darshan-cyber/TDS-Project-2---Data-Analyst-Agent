@@ -33,9 +33,9 @@ import numpy as np
 # Optional image conversion
 try:
     from PIL import Image
-    PIL_AVAILABLE = True
+    PIL_READY = True
 except Exception:
-    PIL_AVAILABLE = False
+    PIL_READY = False
 
 # LangChain / LLM imports
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -45,7 +45,7 @@ from langchain_openai import ChatOpenAI
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
 
 app = FastAPI(title="TDS Data Analyst Agent")
 
@@ -77,7 +77,7 @@ if not OPENAI_API_KEY:
     raise RuntimeError("No OPENAI_API_KEY or OPENAI_API_KEY_{i} found in environment.")
 
 # LangChain OpenAI chat model pointing at AI Pipe
-llm = ChatOpenAI(
+chat_model = ChatOpenAI(
     model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),  # <- default to gpt-5-mini
     temperature=0,
     api_key=OPENAI_API_KEY,
@@ -98,26 +98,26 @@ async def serve_frontend():
         return HTMLResponse(content="<h1>Frontend not found</h1><p>Please ensure index.html is in the same directory as app.py</p>", status_code=404)
 
 
-def parse_keys_and_types(raw_questions: str):
+def parse_keys_and_types(raw_qs: str):
     """
     Parses the key/type section from the questions file.
     Returns:
-        keys_list: list of keys in order
-        type_map: dict key -> casting function
+        ordered_keys: list of keys in order
+        cast_lookup: dict key -> casting function
     """
     import re
-    pattern = r"-\s*`([^`]+)`\s*:\s*(\w+)"
-    matches = re.findall(pattern, raw_questions)
-    type_map_def = {
+    keytype_pattern = r"-\s*`([^`]+)`\s*:\s*(\w+)"
+    keytype_matches = re.findall(keytype_pattern, raw_qs)
+    cast_map = {
         "number": float,
         "string": str,
         "integer": int,
         "int": int,
         "float": float
     }
-    type_map = {key: type_map_def.get(t.lower(), str) for key, t in matches}
-    keys_list = [k for k, _ in matches]
-    return keys_list, type_map
+    cast_lookup = {key: cast_map.get(t.lower(), str) for key, t in keytype_matches}
+    ordered_keys = [k for k, _ in keytype_matches]
+    return ordered_keys, cast_lookup
 
 
 # -----------------------------
@@ -125,17 +125,17 @@ def parse_keys_and_types(raw_questions: str):
 # -----------------------------
 
 @tool
-def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
+def scrape_url_to_dataframe(target_url: str) -> Dict[str, Any]:
     """
     Fetch a URL and return data as a DataFrame (supports HTML tables, CSV, Excel, Parquet, JSON, and plain text).
     Always returns {"status": "success", "data": [...], "columns": [...]} if fetch works.
     """
-    print(f"Scraping URL: {url}")
+    print(f"Scraping URL: {target_url}")
     try:
         from io import BytesIO, StringIO
         from bs4 import BeautifulSoup
 
-        headers = {
+        req_headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -144,97 +144,97 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
             "Referer": "https://www.google.com/",
         }
 
-        resp = requests.get(url, headers=headers, timeout=20)
-        resp.raise_for_status()
-        ctype = resp.headers.get("Content-Type", "").lower()
+        r = requests.get(target_url, headers=req_headers, timeout=20)
+        r.raise_for_status()
+        content_type = r.headers.get("Content-Type", "").lower()
 
-        df = None
+        frame = None
 
         # --- CSV ---
-        if "text/csv" in ctype or url.lower().endswith(".csv"):
-            df = pd.read_csv(BytesIO(resp.content))
+        if "text/csv" in content_type or target_url.lower().endswith(".csv"):
+            frame = pd.read_csv(BytesIO(r.content))
 
         # --- Excel ---
-        elif any(url.lower().endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in ctype:
-            df = pd.read_excel(BytesIO(resp.content))
+        elif any(target_url.lower().endswith(ext) for ext in (".xls", ".xlsx")) or "spreadsheetml" in content_type:
+            frame = pd.read_excel(BytesIO(r.content))
 
         # --- Parquet ---
-        elif url.lower().endswith(".parquet"):
-            df = pd.read_parquet(BytesIO(resp.content))
+        elif target_url.lower().endswith(".parquet"):
+            frame = pd.read_parquet(BytesIO(r.content))
 
         # --- JSON ---
-        elif "application/json" in ctype or url.lower().endswith(".json"):
+        elif "application/json" in content_type or target_url.lower().endswith(".json"):
             try:
-                data = resp.json()
-                df = pd.json_normalize(data)
+                data = r.json()
+                frame = pd.json_normalize(data)
             except Exception:
-                df = pd.DataFrame([{"text": resp.text}])
+                frame = pd.DataFrame([{"text": r.text}])
 
         # --- HTML / Fallback ---
-        elif "text/html" in ctype or re.search(r'/wiki/|\.org|\.com', url, re.IGNORECASE):
-            html_content = resp.text
+        elif "text/html" in content_type or re.search(r'/wiki/|\.org|\.com', target_url, re.IGNORECASE):
+            html_text = r.text
             # Try HTML tables first
             try:
-                tables = pd.read_html(StringIO(html_content), flavor="bs4")
-                if tables:
-                    df = tables[0]
+                html_tables = pd.read_html(StringIO(html_text), flavor="bs4")
+                if html_tables:
+                    frame = html_tables[0]
             except ValueError:
                 pass
 
             # If no table found, fallback to plain text
-            if df is None:
-                soup = BeautifulSoup(html_content, "html.parser")
-                text = soup.get_text(separator="\n", strip=True)
-                df = pd.DataFrame({"text": [text]})
+            if frame is None:
+                soup_obj = BeautifulSoup(html_text, "html.parser")
+                page_text = soup_obj.get_text(separator="\n", strip=True)
+                frame = pd.DataFrame({"text": [page_text]})
 
         # --- Unknown type fallback ---
         else:
-            df = pd.DataFrame({"text": [resp.text]})
+            frame = pd.DataFrame({"text": [r.text]})
 
         # --- Normalize columns ---
-        df.columns = df.columns.map(str).str.replace(r'\[.*\]', '', regex=True).str.strip()
+        frame.columns = frame.columns.map(str).str.replace(r'\[.*\]', '', regex=True).str.strip()
 
         return {
             "status": "success",
-            "data": df.to_dict(orient="records"),
-            "columns": df.columns.tolist()
+            "data": frame.to_dict(orient="records"),
+            "columns": frame.columns.tolist()
         }
 
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    except Exception as err:
+        return {"status": "error", "message": str(err)}
 
 
 # -----------------------------
 # Utilities for executing code safely
 # -----------------------------
-def clean_llm_output(output: str) -> Dict:
+def clean_llm_output(llm_text: str) -> Dict:
     """
     Extract JSON object from LLM output robustly.
     Returns dict or {"error": "..."}
     """
     try:
-        if not output:
+        if not llm_text:
             return {"error": "Empty LLM output"}
         # remove triple-fence markers if present
-        s = re.sub(r"^```(?:json)?\s*", "", output.strip())
-        s = re.sub(r"\s*```$", "", s)
+        content = re.sub(r"^```(?:json)?\s*", "", llm_text.strip())
+        content = re.sub(r"\s*```$", "", content)
         # find outermost JSON object by scanning for balanced braces
-        first = s.find("{")
-        last = s.rfind("}")
-        if first == -1 or last == -1 or last <= first:
-            return {"error": "No JSON object found in LLM output", "raw": s}
-        candidate = s[first:last+1]
+        lbrace = content.find("{")
+        rbrace = content.rfind("}")
+        if lbrace == -1 or rbrace == -1 or rbrace <= lbrace:
+            return {"error": "No JSON object found in LLM output", "raw": content}
+        json_candidate = content[lbrace:rbrace+1]
         try:
-            return json.loads(candidate)
+            return json.loads(json_candidate)
         except Exception as e:
             # fallback: try last balanced pair scanning backwards
-            for i in range(last, first, -1):
-                cand = s[first:i+1]
+            for i in range(rbrace, lbrace, -1):
+                cand = content[lbrace:i+1]
                 try:
                     return json.loads(cand)
                 except Exception:
                     continue
-            return {"error": f"JSON parsing failed: {str(e)}", "raw": candidate}
+            return {"error": f"JSON parsing failed: {str(e)}", "raw": json_candidate}
     except Exception as e:
         return {"error": str(e)}
 
@@ -308,7 +308,7 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
     Returns dict with parsed JSON or error details.
     """
     # create file content
-    preamble = [
+    bootstrap_lines = [
         "import json, sys, gc",
         "import pandas as pd, numpy as np",
         "import matplotlib",
@@ -317,18 +317,18 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "from io import BytesIO",
         "import base64",
     ]
-    if PIL_AVAILABLE:
-        preamble.append("from PIL import Image")
+    if PIL_READY:
+        bootstrap_lines.append("from PIL import Image")
     # inject df if a pickle path provided
     if injected_pickle:
-        preamble.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
-        preamble.append("data = df.to_dict(orient='records')\n")
+        bootstrap_lines.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
+        bootstrap_lines.append("data = df.to_dict(orient='records')\n")
     else:
         # ensure data exists so user code that references data won't break
-        preamble.append("data = globals().get('data', {})\n")
+        bootstrap_lines.append("data = globals().get('data', {})\n")
 
     # plot_to_base64 helper that tries to reduce size under 100_000 bytes
-    helper = r'''
+    plot_helper = r'''
 def plot_to_base64(max_bytes=100000):
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=100)
@@ -374,39 +374,39 @@ def plot_to_base64(max_bytes=100000):
 '''
 
     # Build the code to write
-    script_lines = []
-    script_lines.extend(preamble)
-    script_lines.append(helper)
-    script_lines.append(SCRAPE_FUNC)
-    script_lines.append("\nresults = {}\n")
-    script_lines.append(code)
+    script_buf = []
+    script_buf.extend(bootstrap_lines)
+    script_buf.append(plot_helper)
+    script_buf.append(SCRAPE_FUNC)
+    script_buf.append("\nresults = {}\n")
+    script_buf.append(code)
     # ensure results printed as json
-    script_lines.append("\nprint(json.dumps({'status':'success','result':results}, default=str), flush=True)\n")
+    script_buf.append("\nprint(json.dumps({'status':'success','result':results}, default=str), flush=True)\n")
 
-    tmp = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
-    tmp.write("\n".join(script_lines))
-    tmp.flush()
-    tmp_path = tmp.name
-    tmp.close()
+    tmpfile = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
+    tmpfile.write("\n".join(script_buf))
+    tmpfile.flush()
+    tmp_pathname = tmpfile.name
+    tmpfile.close()
 
     try:
-        completed = subprocess.run([sys.executable, tmp_path],
-                                   capture_output=True, text=True, timeout=timeout)
-        if completed.returncode != 0:
+        proc = subprocess.run([sys.executable, tmp_pathname],
+                              capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
             # collect stderr and stdout for debugging
-            return {"status": "error", "message": completed.stderr.strip() or completed.stdout.strip()}
+            return {"status": "error", "message": proc.stderr.strip() or proc.stdout.strip()}
         # parse stdout as json
-        out = completed.stdout.strip()
+        stdout_text = proc.stdout.strip()
         try:
-            parsed = json.loads(out)
-            return parsed
+            parsed_json = json.loads(stdout_text)
+            return parsed_json
         except Exception as e:
-            return {"status": "error", "message": f"Could not parse JSON output: {str(e)}", "raw": out}
+            return {"status": "error", "message": f"Could not parse JSON output: {str(e)}", "raw": stdout_text}
     except subprocess.TimeoutExpired:
         return {"status": "error", "message": "Execution timed out"}
     finally:
         try:
-            os.unlink(tmp_path)
+            os.unlink(tmp_pathname)
             if injected_pickle and os.path.exists(injected_pickle):
                 os.unlink(injected_pickle)
         except Exception:
@@ -416,13 +416,13 @@ def plot_to_base64(max_bytes=100000):
 # -----------------------------
 # LLM agent setup
 # -----------------------------
-# Use the ChatOpenAI `llm` defined above.
+# Use the ChatOpenAI `chat_model` defined above.
 
 # Tools list for agent (LangChain tool decorator returns metadata for the LLM)
 tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent will still produce code
 
 # Prompt: instruct agent to call the tool and output JSON only
-prompt = ChatPromptTemplate.from_messages([
+agent_prompt = ChatPromptTemplate.from_messages([
     ("system", """You are a full-stack autonomous data analyst agent.
 
 You will receive:
@@ -446,14 +446,14 @@ You must:
     MessagesPlaceholder(variable_name="agent_scratchpad"),
 ])
 
-agent = create_tool_calling_agent(
-    llm=llm,
+tool_agent = create_tool_calling_agent(
+    llm=chat_model,
     tools=[scrape_url_to_dataframe],  # let the agent call tools if it wants; we will also pre-process scrapes
-    prompt=prompt
+    prompt=agent_prompt
 )
 
-agent_executor = AgentExecutor(
-    agent=agent,
+agent_runner = AgentExecutor(
+    agent=tool_agent,
     tools=[scrape_url_to_dataframe],
     verbose=True,
     max_iterations=3,
@@ -474,55 +474,55 @@ def run_agent_safely(llm_input: str) -> Dict:
     4. Execute the code in a temp file and return results mapping questions -> answers
     """
     try:
-        logger.info("Invoking agent with input length=%d", len(llm_input or ""))
-        response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-        raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
-        logger.info("Agent raw_out bytes=%d", len(raw_out.encode("utf-8")) if raw_out else 0)
-        if not raw_out:
-            return {"error": f"Agent returned no output. Full response: {response}"}
+        log.info("Invoking agent with input length=%d", len(llm_input or ""))
+        agent_reply = agent_runner.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+        agent_text = agent_reply.get("output") or agent_reply.get("final_output") or agent_reply.get("text") or ""
+        log.info("Agent raw_out bytes=%d", len(agent_text.encode("utf-8")) if agent_text else 0)
+        if not agent_text:
+            return {"error": f"Agent returned no output. Full response: {agent_reply}"}
 
-        parsed = clean_llm_output(raw_out)
-        if "error" in parsed:
-            return parsed
+        parsed_out = clean_llm_output(agent_text)
+        if "error" in parsed_out:
+            return parsed_out
 
-        if not isinstance(parsed, dict) or "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response format: {parsed}"}
+        if not isinstance(parsed_out, dict) or "code" not in parsed_out or "questions" not in parsed_out:
+            return {"error": f"Invalid agent response format: {parsed_out}"}
 
-        code = parsed["code"]
-        questions: List[str] = parsed["questions"]
+        gen_code = parsed_out["code"]
+        question_list: List[str] = parsed_out["questions"]
 
         # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
-        urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
-        pickle_path = None
-        if urls:
+        url_list = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", gen_code)
+        pickle_file = None
+        if url_list:
             # For now support only the first URL (agent may code multiple scrapes; you can extend this)
-            url = urls[0]
-            tool_resp = scrape_url_to_dataframe(url)
-            if tool_resp.get("status") != "success":
-                return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
+            first_url = url_list[0]
+            scrape_out = scrape_url_to_dataframe(first_url)
+            if scrape_out.get("status") != "success":
+                return {"error": f"Scrape tool failed: {scrape_out.get('message')}"}
             # create df and pickle it
-            df = pd.DataFrame(tool_resp["data"])
-            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            temp_pkl.close()
-            df.to_pickle(temp_pkl.name)
-            pickle_path = temp_pkl.name
+            frame = pd.DataFrame(scrape_out["data"])
+            tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+            tmp_pkl.close()
+            frame.to_pickle(tmp_pkl.name)
+            pickle_file = tmp_pkl.name
 
         # Execute code in temp python script
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
-        if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message', exec_result)}", "raw": exec_result.get("raw")}
+        exec_out = write_and_run_temp_python(gen_code, injected_pickle=pickle_file, timeout=LLM_TIMEOUT_SECONDS)
+        if exec_out.get("status") != "success":
+            return {"error": f"Execution failed: {exec_out.get('message', exec_out)}", "raw": exec_out.get("raw")}
 
-        # exec_result['result'] should be results dict
-        results_dict = exec_result.get("result", {})
+        # exec_out['result'] should be results dict
+        result_map = exec_out.get("result", {})
         # Map to original questions (they asked to use exact question strings)
-        output = {}
-        for q in questions:
-            output[q] = results_dict.get(q, "Answer not found")
-        return output
+        final_map = {}
+        for qtext in question_list:
+            final_map[qtext] = result_map.get(qtext, "Answer not found")
+        return final_map
 
-    except Exception as e:
-        logger.exception("run_agent_safely failed")
-        return {"error": str(e)}
+    except Exception as err:
+        log.exception("run_agent_safely failed")
+        return {"error": str(err)}
 
 
 from fastapi import Request
@@ -533,73 +533,73 @@ from fastapi import Request
 @app.post("/api/")
 async def analyze_data(request: Request):
     try:
-        form = await request.form()
-        questions_file = None
-        data_file = None
+        formdata = await request.form()
+        qfile = None
+        dfile = None
 
-        for key, val in form.items():
-            if hasattr(val, "filename") and val.filename:  # it's a file
-                fname = val.filename.lower()
-                if fname.endswith(".txt") and questions_file is None:
-                    questions_file = val
+        for key, v in formdata.items():
+            if hasattr(v, "filename") and v.filename:  # it's a file
+                fname_lower = v.filename.lower()
+                if fname_lower.endswith(".txt") and qfile is None:
+                    qfile = v
                 else:
-                    data_file = val
+                    dfile = v
 
-        if not questions_file:
+        if not qfile:
             raise HTTPException(400, "Missing questions file (.txt)")
 
-        raw_questions = (await questions_file.read()).decode("utf-8")
-        keys_list, type_map = parse_keys_and_types(raw_questions)
+        qs_text = (await qfile.read()).decode("utf-8")
+        ordered_keys, cast_lookup = parse_keys_and_types(qs_text)
 
-        pickle_path = None
-        df_preview = ""
-        dataset_uploaded = False
+        pickle_file = None
+        df_head_text = ""
+        has_dataset = False
 
-        if data_file:
-            dataset_uploaded = True
-            filename = data_file.filename.lower()
-            content = await data_file.read()
+        if dfile:
+            has_dataset = True
+            data_filename = dfile.filename.lower()
+            file_bytes = await dfile.read()
             from io import BytesIO
 
-            if filename.endswith(".csv"):
-                df = pd.read_csv(BytesIO(content))
-            elif filename.endswith((".xlsx", ".xls")):
-                df = pd.read_excel(BytesIO(content))
-            elif filename.endswith(".parquet"):
-                df = pd.read_parquet(BytesIO(content))
-            elif filename.endswith(".json"):
+            if data_filename.endswith(".csv"):
+                frame = pd.read_csv(BytesIO(file_bytes))
+            elif data_filename.endswith((".xlsx", ".xls")):
+                frame = pd.read_excel(BytesIO(file_bytes))
+            elif data_filename.endswith(".parquet"):
+                frame = pd.read_parquet(BytesIO(file_bytes))
+            elif data_filename.endswith(".json"):
                 try:
-                    df = pd.read_json(BytesIO(content))
+                    frame = pd.read_json(BytesIO(file_bytes))
                 except ValueError:
-                    df = pd.DataFrame(json.loads(content.decode("utf-8")))
-            elif filename.endswith(".png") or filename.endswith(".jpg") or filename.endswith(".jpeg"):
+                    frame = pd.DataFrame(json.loads(file_bytes.decode("utf-8")))
+            elif data_filename.endswith(".png") or data_filename.endswith(".jpg") or data_filename.endswith(".jpeg"):
                 try:
-                    if PIL_AVAILABLE:
-                        image = Image.open(BytesIO(content))
-                        image = image.convert("RGB")  # ensure RGB format
-                        df = pd.DataFrame({"image": [image]})
+                    if PIL_READY:
+                        img = Image.open(BytesIO(file_bytes))
+                        img = img.convert("RGB")  # ensure RGB format
+                        frame = pd.DataFrame({"image": [img]})
                     else:
                         raise HTTPException(400, "PIL not available for image processing")
                 except Exception as e:
                     raise HTTPException(400, f"Image processing failed: {str(e)}")  
             else:
-                raise HTTPException(400, f"Unsupported data file type: {filename}")
+                raise HTTPException(400, f"Unsupported data file type: {data_filename}")
 
             # Pickle for injection
-            temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-            temp_pkl.close()
-            df.to_pickle(temp_pkl.name)
-            pickle_path = temp_pkl.name
+            tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+            tmp_pkl.close()
+            frame.to_pickle(tmp_pkl.name)
+            pickle_file = tmp_pkl.name
 
-            df_preview = (
-                f"\n\nThe uploaded dataset has {len(df)} rows and {len(df.columns)} columns.\n"
-                f"Columns: {', '.join(df.columns.astype(str))}\n"
-                f"First rows:\n{df.head(5).to_markdown(index=False)}\n"
+            df_head_text = (
+                f"\n\nThe uploaded dataset has {len(frame)} rows and {len(frame.columns)} columns.\n"
+                f"Columns: {', '.join(frame.columns.astype(str))}\n"
+                f"First rows:\n{frame.head(5).to_markdown(index=False)}\n"
             )
 
         # Build rules based on data presence
-        if dataset_uploaded:
-            llm_rules = (
+        if has_dataset:
+            rules_text = (
                 "Rules:\n"
                 "1) You have access to a pandas DataFrame called `df` and its dictionary form `data`.\n"
                 "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
@@ -610,7 +610,7 @@ async def analyze_data(request: Request):
                 "5) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
         else:
-            llm_rules = (
+            rules_text = (
                 "Rules:\n"
                 "1) If you need web data, CALL scrape_url_to_dataframe(url).\n"
                 "2) Produce a final JSON object with keys:\n"
@@ -619,47 +619,47 @@ async def analyze_data(request: Request):
                 "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
 
-        llm_input = (
-            f"{llm_rules}\nQuestions:\n{raw_questions}\n"
-            f"{df_preview if df_preview else ''}"
+        prompt_text = (
+            f"{rules_text}\nQuestions:\n{qs_text}\n"
+            f"{df_head_text if df_head_text else ''}"
             "Respond with the JSON object only."
         )
 
         # Run agent
         import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as ex:
-            fut = ex.submit(run_agent_safely_unified, llm_input, pickle_path)
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(run_agent_safely_unified, prompt_text, pickle_file)
             try:
-                result = fut.result(timeout=LLM_TIMEOUT_SECONDS)
+                result_payload = future.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
                 raise HTTPException(408, "Processing timeout")
 
-        if "error" in result:
-            raise HTTPException(500, detail=result["error"])
+        if "error" in result_payload:
+            raise HTTPException(500, detail=result_payload["error"])
 
         # Post-process key mapping & type casting
-        if keys_list and type_map:
-            mapped = {}
-            for idx, q in enumerate(result.keys()):
-                if idx < len(keys_list):
-                    key = keys_list[idx]
-                    caster = type_map.get(key, str)
+        if ordered_keys and cast_lookup:
+            projected = {}
+            for i, qtxt in enumerate(result_payload.keys()):
+                if i < len(ordered_keys):
+                    k = ordered_keys[i]
+                    to_type = cast_lookup.get(k, str)
                     try:
-                        val = result[q]
-                        if isinstance(val, str) and val.startswith("data:image/"):
+                        v = result_payload[qtxt]
+                        if isinstance(v, str) and v.startswith("data:image/"):
                             # Remove data URI prefix
-                            val = val.split(",", 1)[1] if "," in val else val
-                        mapped[key] = caster(val) if val not in (None, "") else val
+                            v = v.split(",", 1)[1] if "," in v else v
+                        projected[k] = to_type(v) if v not in (None, "") else v
                     except Exception:
-                        mapped[key] = result[q]
-            result = mapped
+                        projected[k] = result_payload[qtxt]
+            result_payload = projected
 
-        return JSONResponse(content=result)
+        return JSONResponse(content=result_payload)
 
     except HTTPException as he:
         raise he
     except Exception as e:
-        logger.exception("analyze_data failed")
+        log.exception("analyze_data failed")
         raise HTTPException(500, detail=str(e))
 
 
@@ -671,49 +671,49 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     - If no pickle_path, falls back to scraping when needed.
     """
     try:
-        max_retries = 3
-        raw_out = ""
-        for attempt in range(1, max_retries + 1):
-            logger.info("Agent attempt %d/%d", attempt, max_retries)
-            response = agent_executor.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
-            raw_out = response.get("output") or response.get("final_output") or response.get("text") or ""
-            if raw_out:
+        attempt_limit = 3
+        agent_text = ""
+        for attempt in range(1, attempt_limit + 1):
+            log.info("Agent attempt %d/%d", attempt, attempt_limit)
+            agent_reply = agent_runner.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
+            agent_text = agent_reply.get("output") or agent_reply.get("final_output") or agent_reply.get("text") or ""
+            if agent_text:
                 break
-        if not raw_out:
-            return {"error": f"Agent returned no output after {max_retries} attempts"}
+        if not agent_text:
+            return {"error": f"Agent returned no output after {attempt_limit} attempts"}
 
-        parsed = clean_llm_output(raw_out)
-        if "error" in parsed:
-            return parsed
+        parsed_out = clean_llm_output(agent_text)
+        if "error" in parsed_out:
+            return parsed_out
 
-        if "code" not in parsed or "questions" not in parsed:
-            return {"error": f"Invalid agent response: {parsed}"}
+        if "code" not in parsed_out or "questions" not in parsed_out:
+            return {"error": f"Invalid agent response: {parsed_out}"}
 
-        code = parsed["code"]
-        questions = parsed["questions"]
+        gen_code = parsed_out["code"]
+        question_list = parsed_out["questions"]
 
         if pickle_path is None:
-            urls = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", code)
-            if urls:
-                url = urls[0]
-                tool_resp = scrape_url_to_dataframe(url)
-                if tool_resp.get("status") != "success":
-                    return {"error": f"Scrape tool failed: {tool_resp.get('message')}"}
-                df = pd.DataFrame(tool_resp["data"])
-                temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-                temp_pkl.close()
-                df.to_pickle(temp_pkl.name)
-                pickle_path = temp_pkl.name
+            url_list = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", gen_code)
+            if url_list:
+                target = url_list[0]
+                scrape_out = scrape_url_to_dataframe(target)
+                if scrape_out.get("status") != "success":
+                    return {"error": f"Scrape tool failed: {scrape_out.get('message')}"}
+                frame = pd.DataFrame(scrape_out["data"])
+                tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+                tmp_pkl.close()
+                frame.to_pickle(tmp_pkl.name)
+                pickle_path = tmp_pkl.name
 
-        exec_result = write_and_run_temp_python(code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
-        if exec_result.get("status") != "success":
-            return {"error": f"Execution failed: {exec_result.get('message')}", "raw": exec_result.get("raw")}
+        exec_out = write_and_run_temp_python(gen_code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
+        if exec_out.get("status") != "success":
+            return {"error": f"Execution failed: {exec_out.get('message')}", "raw": exec_out.get("raw")}
 
-        results_dict = exec_result.get("result", {})
-        return {q: results_dict.get(q, "Answer not found") for q in questions}
+        result_map = exec_out.get("result", {})
+        return {q: result_map.get(q, "Answer not found") for q in question_list}
 
     except Exception as e:
-        logger.exception("run_agent_safely_unified failed")
+        log.exception("run_agent_safely_unified failed")
         return {"error": str(e)}
 
 
@@ -800,14 +800,14 @@ async def run_in_thread(fn, *a, timeout=30, **kw):
 # ---- Diagnostic check functions (safely return dicts) ----
 def _env_check(required=None):
     required = required or []
-    out = {}
+    state = {}
     for k in required:
-        out[k] = {"present": bool(os.getenv(k)), "masked": (os.getenv(k)[:4] + "..." + os.getenv(k)[-4:]) if os.getenv(k) else None}
+        state[k] = {"present": bool(os.getenv(k)), "masked": (os.getenv(k)[:4] + "..." + os.getenv(k)[-4:]) if os.getenv(k) else None}
     # Also include simple helpful values
-    out["GOOGLE_MODEL"] = os.getenv("GOOGLE_MODEL")
-    out["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
-    out["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL")
-    return out
+    state["GOOGLE_MODEL"] = os.getenv("GOOGLE_MODEL")
+    state["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
+    state["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL")
+    return state
 
 def _system_info():
     info = {
