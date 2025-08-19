@@ -8,7 +8,7 @@ import sys
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import seaborn as sns  # retained
+import seaborn as sns  # kept as requested
 import io
 import os
 import re
@@ -37,7 +37,7 @@ try:
 except Exception:
     PIL_READY = False
 
-# Optional PDF libs
+# Optional PDF libs (use if available)
 try:
     import pdfplumber
     PDFPLUMBER_READY = True
@@ -45,10 +45,19 @@ except Exception:
     PDFPLUMBER_READY = False
 
 try:
-    import tabula  # requires Java runtime on the host
-    TABULA_READY = True
+    from pypdf import PdfReader
+    PYPDF_READY = True
 except Exception:
-    TABULA_READY = False
+    PYPDF_READY = False
+
+# NEW: optional pdfminer text extractor
+try:
+    from pdfminer.high_level import extract_text as pdfminer_extract_text
+    PDFMINER_READY = True
+except Exception:
+    PDFMINER_READY = False
+
+import zlib  # for raw fallback on Flate streams
 
 # LangChain / LLM imports
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -135,210 +144,188 @@ def parse_keys_and_types(raw_qs: str):
 
 
 # -----------------------------
-# PDF helpers (minimal, layered)
+# PDF helpers (updated)
 # -----------------------------
-def _combine_tables_with_index(tables: List[pd.DataFrame]) -> pd.DataFrame:
-    clean_tables = []
-    for i, t in enumerate(tables):
-        if t is None or len(t) == 0:
-            continue
-        df = t.copy()
-        df.columns = pd.Index([str(c) for c in df.columns])
-        df.insert(0, "table_index", i)
-        clean_tables.append(df)
-    if not clean_tables:
-        return pd.DataFrame()
-    return pd.concat(clean_tables, ignore_index=True, sort=False)
 
+def _pdf_fallback_text_from_bytes(pdf_bytes: bytes) -> str:
+    """
+    Very rough, pure-Python fallback:
+    - Try to locate Flate-compressed streams and decompress with zlib.
+    - If nothing decompresses, extract long printable sequences from raw bytes.
+    """
+    text_chunks = []
 
-def pdf_bytes_to_dataframe(pdf_bytes: bytes) -> pd.DataFrame:
-    """
-    Best-effort PDF to DataFrame:
-      1) Try tabula (lattice/stream) to extract tables (Java required).
-      2) Fallback to pdfplumber to get tables & text.
-      3) Final fallback: a single-row DataFrame with a note if nothing is extractable.
-    """
-    # Try Tabula
-    if TABULA_READY:
-        tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
-        try:
-            tmp.write(pdf_bytes)
-            tmp.flush()
-            tmp.close()
-            tabs = []
-            try:
-                tabs = tabula.read_pdf(tmp.name, pages="all", multiple_tables=True, lattice=True)
-            except Exception:
-                pass
-            if not tabs:
+    # Try Flate streams (stream ... endstream)
+    try:
+        raw = pdf_bytes
+        # find all streams
+        for m in re.finditer(rb"stream\s*([\s\S]*?)\s*endstream", raw, flags=re.MULTILINE):
+            block = m.group(1)
+            # common: streams begin with newline; try zlib
+            for wbits in (15, -15):
                 try:
-                    tabs = tabula.read_pdf(tmp.name, pages="all", multiple_tables=True, stream=True)
+                    dec = zlib.decompress(block, wbits)
+                    try:
+                        text_chunks.append(dec.decode("utf-8", "ignore"))
+                    except Exception:
+                        text_chunks.append(dec.decode("latin-1", "ignore"))
+                    break
                 except Exception:
-                    pass
-            if tabs:
-                df_tabs = _combine_tables_with_index(tabs)
-                if not df_tabs.empty:
-                    return df_tabs
-        finally:
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
+                    continue
+    except Exception:
+        pass
 
-    # Fallback to pdfplumber
+    combined = "\n".join([t for t in text_chunks if t and t.strip()])
+
+    if not combined:
+        # As last resort, pull visible ASCII-ish sequences directly from bytes
+        try:
+            ascii_like = re.findall(rb"[ -~\t\r\n]{5,}", pdf_bytes)  # printable
+            combined = "\n".join([a.decode("latin-1", "ignore") for a in ascii_like])
+        except Exception:
+            combined = ""
+
+    return combined.strip()
+
+
+def extract_pdf_to_dataframe(pdf_bytes: bytes) -> (pd.DataFrame, str):
+    """
+    Attempt to extract tables and/or text from a PDF.
+    Return (df, info_text). df is:
+      - the largest detected table (if any), or
+      - a single-column DataFrame with 'text' if only text found.
+    info_text is a brief diagnostic string.
+    """
+    # 1) pdfplumber: tables + text (try empty password if encrypted)
     if PDFPLUMBER_READY:
         try:
-            tables_collected = []
+            tables = []
             texts = []
-            with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
-                for page in pdf.pages:
-                    try:
-                        t = page.extract_text() or ""
-                        if t:
-                            texts.append(t)
-                    except Exception:
-                        pass
-                    try:
-                        raw_tables = page.extract_tables()
-                        for rt in raw_tables or []:
-                            if not rt:
-                                continue
-                            header = rt[0]
-                            body = rt[1:] if all(len(r) == len(header) for r in rt[1:]) else rt
-                            df_t = pd.DataFrame(body, columns=[str(c) for c in header] if body is rt[1:] else None)
-                            tables_collected.append(df_t)
-                    except Exception:
-                        pass
-            if tables_collected:
-                df_all = _combine_tables_with_index(tables_collected)
-                if not df_all.empty:
-                    return df_all
-            full_text = "\n".join(texts).strip()
-            if full_text:
-                return pd.DataFrame({"text": [full_text]})
-        except Exception:
-            pass
+            # pdfplumber will raise on password; try with and without empty password
+            try:
+                with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+                    pages_iter = pdf.pages
+                    for page in pages_iter:
+                        try:
+                            t = page.extract_tables() or []
+                            for tbl in t:
+                                if not tbl:
+                                    continue
+                                tbl = [row for row in tbl if any(cell is not None and str(cell).strip() for cell in row)]
+                                if not tbl:
+                                    continue
+                                header = tbl[0]
+                                body = tbl[1:] if len(tbl) > 1 else []
+                                if not header or len(set([str(h).strip() for h in header if h is not None])) != len(header):
+                                    cols = [f"col_{i}" for i in range(len(header or []))]
+                                    df_tbl = pd.DataFrame(body, columns=cols if body and len(body[0]) == len(cols) else None)
+                                else:
+                                    df_tbl = pd.DataFrame(body, columns=[str(h).strip() if h is not None else "" for h in header])
+                                if not df_tbl.empty:
+                                    df_tbl = df_tbl.dropna(how="all", axis=1)
+                                if not df_tbl.empty:
+                                    tables.append(df_tbl)
+                        except Exception:
+                            pass
+                        try:
+                            txt = page.extract_text() or ""
+                            if txt.strip():
+                                texts.append(txt)
+                        except Exception:
+                            pass
+            except Exception:
+                # try again with empty password
+                try:
+                    with pdfplumber.open(BytesIO(pdf_bytes), password="") as pdf:
+                        for page in pdf.pages:
+                            try:
+                                t = page.extract_tables() or []
+                                for tbl in t:
+                                    if not tbl:
+                                        continue
+                                    tbl = [row for row in tbl if any(cell is not None and str(cell).strip() for cell in row)]
+                                    if not tbl:
+                                        continue
+                                    header = tbl[0]
+                                    body = tbl[1:] if len(tbl) > 1 else []
+                                    if not header or len(set([str(h).strip() for h in header if h is not None])) != len(header):
+                                        cols = [f"col_{i}" for i in range(len(header or []))]
+                                        df_tbl = pd.DataFrame(body, columns=cols if body and len(body[0]) == len(cols) else None)
+                                    else:
+                                        df_tbl = pd.DataFrame(body, columns=[str(h).strip() if h is not None else "" for h in header])
+                                    if not df_tbl.empty:
+                                        df_tbl = df_tbl.dropna(how="all", axis=1)
+                                    if not df_tbl.empty:
+                                        tables.append(df_tbl)
+                            except Exception:
+                                pass
+                            try:
+                                txt = page.extract_text() or ""
+                                if txt.strip():
+                                    texts.append(txt)
+                            except Exception:
+                                pass
+                except Exception as e2:
+                    log.warning("pdfplumber failed (even with empty password): %s", e2)
 
-    return pd.DataFrame({
-        "text": [""],
-        "note": ["PDF parsing libraries not available or no extractable content found."],
-    })
-
-
-# -----------------------------
-# DB helpers (SQLite / DuckDB)
-# -----------------------------
-def _detect_db_backend(tmp_path: str) -> str:
-    """
-    Returns 'sqlite', 'duckdb', or '' if neither opens.
-    """
-    # Try SQLite
-    try:
-        import sqlite3
-        con = sqlite3.connect(tmp_path)
-        con.execute("SELECT 1")
-        con.close()
-        return "sqlite"
-    except Exception:
-        pass
-
-    # Try DuckDB
-    try:
-        import duckdb
-        con = duckdb.connect(tmp_path)
-        con.execute("SELECT 1")
-        con.close()
-        return "duckdb"
-    except Exception:
-        pass
-
-    return ""
-
-
-def _sqlite_list_tables(path: str) -> List[str]:
-    import sqlite3
-    con = sqlite3.connect(path)
-    cur = con.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    rows = cur.fetchall()
-    con.close()
-    return [r[0] for r in rows]
-
-
-def _sqlite_sample_table(path: str, table: str, limit: int = 5) -> pd.DataFrame:
-    import sqlite3
-    con = sqlite3.connect(path)
-    try:
-        df = pd.read_sql_query(f"SELECT * FROM {table} LIMIT {int(limit)}", con)
-    finally:
-        con.close()
-    return df
-
-
-def _duckdb_list_tables(path: str) -> List[str]:
-    import duckdb
-    con = duckdb.connect(path)
-    try:
-        df = con.execute("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE'").df()
-        # Prefer 'main' schema if exists; otherwise include all
-        if "table_schema" in df and "table_name" in df:
-            return [f"{r['table_schema']}.{r['table_name']}" if r["table_schema"] not in ("main", "") else r["table_name"] for _, r in df.iterrows()]
-        return []
-    finally:
-        con.close()
-
-
-def _duckdb_sample_table(path: str, table: str, limit: int = 5) -> pd.DataFrame:
-    import duckdb
-    con = duckdb.connect(path)
-    try:
-        df = con.execute(f"SELECT * FROM {table} LIMIT {int(limit)}").df()
-    finally:
-        con.close()
-    return df
-
-
-def db_bytes_preview_dataframe(db_bytes: bytes) -> Dict[str, Any]:
-    """
-    Write bytes to a temp .db file, detect backend, list tables, and return a small preview DataFrame
-    plus metadata (backend, tables). The DataFrame is from the first discovered table (up to 500 rows).
-    """
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp.write(db_bytes)
-    tmp.flush()
-    tmp.close()
-    path = tmp.name
-    backend = _detect_db_backend(path)
-    meta = {"backend": backend, "tables": []}
-    try:
-        if backend == "sqlite":
-            tables = _sqlite_list_tables(path)
-            meta["tables"] = tables
             if tables:
-                df = _sqlite_sample_table(path, tables[0], limit=500)
-                return {"df": df, "meta": meta, "path": path}
-            return {"df": pd.DataFrame(), "meta": meta, "path": path}
-        elif backend == "duckdb":
-            tables = _duckdb_list_tables(path)
-            meta["tables"] = tables
-            if tables:
-                df = _duckdb_sample_table(path, tables[0], limit=500)
-                return {"df": df, "meta": meta, "path": path}
-            return {"df": pd.DataFrame(), "meta": meta, "path": path}
-        else:
-            # Unknown DB, still return a path so the sandbox can try queries if possible
-            return {"df": pd.DataFrame({"note": ["Unknown .db format"]}), "meta": meta, "path": path}
-    except Exception as e:
-        return {"df": pd.DataFrame({"error": [str(e)]}), "meta": meta, "path": path}
+                best = max(tables, key=lambda d: (len(d) * max(1, len(d.columns))))
+                return best.reset_index(drop=True), "pdfplumber:table"
+            if texts:
+                text_joined = "\n".join(texts).strip()
+                if text_joined:
+                    return pd.DataFrame({"text": [text_joined]}), "pdfplumber:text"
+        except Exception as e:
+            log.warning("pdfplumber failed: %s", e)
+
+    # 2) pypdf text-only fallback (try decrypt with empty password if encrypted)
+    if PYPDF_READY:
+        try:
+            reader = PdfReader(BytesIO(pdf_bytes))
+            if getattr(reader, "is_encrypted", False):
+                try:
+                    reader.decrypt("")  # try empty password
+                except Exception:
+                    pass
+            pages_text = []
+            for p in reader.pages:
+                try:
+                    t = p.extract_text() or ""
+                    if t.strip():
+                        pages_text.append(t)
+                except Exception:
+                    continue
+            if pages_text:
+                return pd.DataFrame({"text": ["\n".join(pages_text).strip()]}), "pypdf:text"
+        except Exception as e:
+            log.warning("pypdf failed: %s", e)
+
+    # 2.5) NEW: pdfminer text-only fallback
+    if PDFMINER_READY:
+        try:
+            txt = pdfminer_extract_text(BytesIO(pdf_bytes)) or ""
+            if txt.strip():
+                return pd.DataFrame({"text": [txt.strip()]}), "pdfminer:text"
+        except Exception as e:
+            log.warning("pdfminer failed: %s", e)
+
+    # 3) pure-Python raw fallback
+    fallback_text = _pdf_fallback_text_from_bytes(pdf_bytes)
+    if fallback_text:
+        return pd.DataFrame({"text": [fallback_text]}), "raw:flate-or-ascii"
+
+    # nothing found
+    raise HTTPException(400, "No extractable content found in PDF (scanned images or unsupported PDF).")
 
 
 # -----------------------------
 # Tools
 # -----------------------------
+
 @tool
 def scrape_url_to_dataframe(target_url: str) -> Dict[str, Any]:
     """
-    Fetch a URL and return data as a DataFrame (supports HTML tables, CSV, Excel, Parquet, JSON, PDF, .db (best-effort), and plain text).
+    Fetch a URL and return data as a DataFrame (supports HTML tables, CSV, Excel, Parquet, JSON, PDF, and plain text).
     Always returns {"status": "success", "data": [...], "columns": [...]} if fetch works.
     """
     print(f"Scraping URL: {target_url}")
@@ -361,15 +348,10 @@ def scrape_url_to_dataframe(target_url: str) -> Dict[str, Any]:
 
         frame = None
 
-        # --- DB from URL ---
-        if target_url.lower().endswith((".db", ".sqlite", ".duckdb")) or ("application/octet-stream" in content_type and target_url.lower().endswith(".db")):
-            preview = db_bytes_preview_dataframe(r.content)
-            frame = preview["df"]
-
         # --- PDF ---
-        elif "application/pdf" in content_type or target_url.lower().endswith(".pdf"):
-            pdf_bytes = r.content
-            frame = pdf_bytes_to_dataframe(pdf_bytes)
+        if "application/pdf" in content_type or target_url.lower().endswith(".pdf"):
+            df_pdf, _info = extract_pdf_to_dataframe(r.content)
+            frame = df_pdf
 
         # --- CSV ---
         elif "text/csv" in content_type or target_url.lower().endswith(".csv"):
@@ -394,6 +376,7 @@ def scrape_url_to_dataframe(target_url: str) -> Dict[str, Any]:
         # --- HTML / Fallback ---
         elif "text/html" in content_type or re.search(r'/wiki/|\.org|\.com', target_url, re.IGNORECASE):
             html_text = r.text
+            # Try HTML tables first
             try:
                 html_tables = pd.read_html(StringIO(html_text), flavor="bs4")
                 if html_tables:
@@ -401,14 +384,17 @@ def scrape_url_to_dataframe(target_url: str) -> Dict[str, Any]:
             except ValueError:
                 pass
 
+            # If no table found, fallback to plain text
             if frame is None:
                 soup_obj = BeautifulSoup(html_text, "html.parser")
                 page_text = soup_obj.get_text(separator="\n", strip=True)
                 frame = pd.DataFrame({"text": [page_text]})
 
+        # --- Unknown type fallback ---
         else:
             frame = pd.DataFrame({"text": [r.text]})
 
+        # --- Normalize columns ---
         frame.columns = frame.columns.map(str).str.replace(r'\[.*\]', '', regex=True).str.strip()
 
         return {
@@ -432,8 +418,10 @@ def clean_llm_output(llm_text: str) -> Dict:
     try:
         if not llm_text:
             return {"error": "Empty LLM output"}
+        # remove triple-fence markers if present
         content = re.sub(r"^```(?:json)?\s*", "", llm_text.strip())
         content = re.sub(r"\s*```$", "", content)
+        # find outermost JSON object by scanning for balanced braces
         lbrace = content.find("{")
         rbrace = content.rfind("}")
         if lbrace == -1 or rbrace == -1 or rbrace <= lbrace:
@@ -442,6 +430,7 @@ def clean_llm_output(llm_text: str) -> Dict:
         try:
             return json.loads(json_candidate)
         except Exception as e:
+            # fallback: try last balanced pair scanning backwards
             for i in range(rbrace, lbrace, -1):
                 cand = content[lbrace:i+1]
                 try:
@@ -457,7 +446,7 @@ def _bytes_to_data_uri(img_bytes: bytes, mime="image/png") -> str:
     b64 = base64.b64encode(img_bytes).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
-def run_vision_extraction(questions_text: str, image_uris: list[str]) -> Dict:
+def run_vision_extraction(questions_text: str, image_uris: List[str]) -> Dict:
     """
     Send images + instructions to a vision-capable LLM and expect JSON-only output.
     No Python OCR: the model must visually read the images.
@@ -470,10 +459,12 @@ def run_vision_extraction(questions_text: str, image_uris: list[str]) -> Dict:
         "Return strictly valid JSON as the final answer. No extra text."
     )
 
+    # Build a multimodal human message: text + images
     msg_content = [{"type": "text", "text": questions_text}]
     for uri in image_uris:
         msg_content.append({"type": "image_url", "image_url": {"url": uri}})
 
+    # Call the configured LLM
     resp = chat_model.invoke([
         SystemMessage(content=system_msg),
         HumanMessage(content=msg_content),
@@ -512,20 +503,28 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
     if tables:
         df = tables[0]  # Take first table
         df.columns = [str(c).strip() for c in df.columns]
+        
+        # Ensure all columns are unique and string
         df.columns = [str(col) for col in df.columns]
+
         return {
             "status": "success",
             "data": df.to_dict(orient="records"),
             "columns": list(df.columns)
         }
     else:
+        # Fallback to plain text
         text_data = soup.get_text(separator="\n", strip=True)
+
+        # Try to detect possible "keys" from text like Runtime, Genre, etc.
         detected_cols = set(re.findall(r"\b[A-Z][a-zA-Z ]{2,15}\b", text_data))
-        df = pd.DataFrame([{}])
+        df = pd.DataFrame([{}])  # start empty
         for col in detected_cols:
             df[col] = None
+
         if df.empty:
             df["text"] = [text_data]
+
         return {
             "status": "success",
             "data": df.to_dict(orient="records"),
@@ -534,18 +533,17 @@ def scrape_url_to_dataframe(url: str) -> Dict[str, Any]:
 '''
 
 
-def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60,
-                              injected_db_path: str = None, injected_db_backend: str = None) -> Dict[str, Any]:
+def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: int = 60) -> Dict[str, Any]:
     """
     Write a temp python file which:
       - provides a safe environment (imports)
       - loads df/from pickle if provided into df and data variables
-      - defines helpers:
-          plot_to_base64(), list_tables(), read_table(), sql_to_dataframe()
-        (DB helpers active when a DB path is provided)
+      - defines a robust plot_to_base64() helper that ensures < 100kB (attempts resizing/conversion)
       - executes the user code (which should populate `results` dict)
       - prints json.dumps({"status":"success","result":results})
+    Returns dict with parsed JSON or error details.
     """
+    # create file content
     bootstrap_lines = [
         "import json, sys, gc",
         "import pandas as pd, numpy as np",
@@ -554,22 +552,19 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
         "import matplotlib.pyplot as plt",
         "from io import BytesIO",
         "import base64",
+        "import seaborn as sns",
     ]
     if PIL_READY:
         bootstrap_lines.append("from PIL import Image")
-    if injected_db_path:
-        bootstrap_lines.append(f"DB_PATH = r'''{injected_db_path}'''")
-        bootstrap_lines.append(f"DB_BACKEND = r'''{injected_db_backend or ''}'''")
-    else:
-        bootstrap_lines.append("DB_PATH = ''")
-        bootstrap_lines.append("DB_BACKEND = ''")
-
+    # inject df if a pickle path provided
     if injected_pickle:
         bootstrap_lines.append(f"df = pd.read_pickle(r'''{injected_pickle}''')\n")
         bootstrap_lines.append("data = df.to_dict(orient='records')\n")
     else:
+        # ensure data exists so user code that references data won't break
         bootstrap_lines.append("data = globals().get('data', {})\n")
 
+    # plot_to_base64 helper that tries to reduce size under 100_000 bytes
     plot_helper = r'''
 def plot_to_base64(max_bytes=100000):
     buf = BytesIO()
@@ -578,6 +573,7 @@ def plot_to_base64(max_bytes=100000):
     img_bytes = buf.getvalue()
     if len(img_bytes) <= max_bytes:
         return base64.b64encode(img_bytes).decode('ascii')
+    # try decreasing dpi/figure size iteratively
     for dpi in [80, 60, 50, 40, 30]:
         buf = BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=dpi)
@@ -585,6 +581,7 @@ def plot_to_base64(max_bytes=100000):
         b = buf.getvalue()
         if len(b) <= max_bytes:
             return base64.b64encode(b).decode('ascii')
+    # if Pillow available, try convert to WEBP which is typically smaller
     try:
         from PIL import Image
         buf = BytesIO()
@@ -597,6 +594,7 @@ def plot_to_base64(max_bytes=100000):
         ob = out_buf.getvalue()
         if len(ob) <= max_bytes:
             return base64.b64encode(ob).decode('ascii')
+        # try lower quality
         out_buf = BytesIO()
         im.save(out_buf, format='WEBP', quality=60, method=6)
         out_buf.seek(0)
@@ -605,99 +603,21 @@ def plot_to_base64(max_bytes=100000):
             return base64.b64encode(ob).decode('ascii')
     except Exception:
         pass
+    # as last resort return downsized PNG even if > max_bytes
     buf = BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=20)
     buf.seek(0)
     return base64.b64encode(buf.getvalue()).decode('ascii')
 '''
 
-    # DB helpers exposed to the agent code
-    db_helpers = r'''
-def list_tables():
-    """
-    Returns a list of table names for the uploaded DB (SQLite or DuckDB).
-    """
-    if not DB_PATH or not DB_BACKEND:
-        return []
-    if DB_BACKEND.lower() == 'sqlite':
-        import sqlite3
-        con = sqlite3.connect(DB_PATH)
-        try:
-            cur = con.cursor()
-            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-            return [r[0] for r in cur.fetchall()]
-        finally:
-            con.close()
-    elif DB_BACKEND.lower() == 'duckdb':
-        import duckdb
-        con = duckdb.connect(DB_PATH)
-        try:
-            df = con.execute("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type='BASE TABLE'").df()
-            out = []
-            for _, r in df.iterrows():
-                schema = str(r.get('table_schema', '') or '')
-                name = str(r.get('table_name', '') or '')
-                out.append(f"{schema}.{name}" if schema not in ('main','') else name)
-            return out
-        finally:
-            con.close()
-    return []
-
-def read_table(table_name, limit=None):
-    """
-    Returns a pandas DataFrame for `table_name` with optional LIMIT.
-    """
-    if not DB_PATH or not DB_BACKEND:
-        return pd.DataFrame()
-    if DB_BACKEND.lower() == 'sqlite':
-        import sqlite3
-        con = sqlite3.connect(DB_PATH)
-        try:
-            q = f"SELECT * FROM {table_name}" + (f" LIMIT {int(limit)}" if limit else "")
-            return pd.read_sql_query(q, con)
-        finally:
-            con.close()
-    elif DB_BACKEND.lower() == 'duckdb':
-        import duckdb
-        con = duckdb.connect(DB_PATH)
-        try:
-            q = f"SELECT * FROM {table_name}" + (f" LIMIT {int(limit)}" if limit else "")
-            return con.execute(q).df()
-        finally:
-            con.close()
-    return pd.DataFrame()
-
-def sql_to_dataframe(sql):
-    """
-    Executes a SQL query against the uploaded DB and returns a pandas DataFrame.
-    """
-    if not DB_PATH or not DB_BACKEND:
-        return pd.DataFrame()
-    if DB_BACKEND.lower() == 'sqlite':
-        import sqlite3
-        con = sqlite3.connect(DB_PATH)
-        try:
-            return pd.read_sql_query(sql, con)
-        finally:
-            con.close()
-    elif DB_BACKEND.lower() == 'duckdb':
-        import duckdb
-        con = duckdb.connect(DB_PATH)
-        try:
-            return con.execute(sql).df()
-        finally:
-            con.close()
-    return pd.DataFrame()
-'''
-
+    # Build the code to write
     script_buf = []
     script_buf.extend(bootstrap_lines)
     script_buf.append(plot_helper)
-    if injected_db_path:
-        script_buf.append(db_helpers)
     script_buf.append(SCRAPE_FUNC)
     script_buf.append("\nresults = {}\n")
     script_buf.append(code)
+    # ensure results printed as json
     script_buf.append("\nprint(json.dumps({'status':'success','result':results}, default=str), flush=True)\n")
 
     tmpfile = tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False, encoding='utf-8')
@@ -710,7 +630,9 @@ def sql_to_dataframe(sql):
         proc = subprocess.run([sys.executable, tmp_pathname],
                               capture_output=True, text=True, timeout=timeout)
         if proc.returncode != 0:
+            # collect stderr and stdout for debugging
             return {"status": "error", "message": proc.stderr.strip() or proc.stdout.strip()}
+        # parse stdout as json
         stdout_text = proc.stdout.strip()
         try:
             parsed_json = json.loads(stdout_text)
@@ -731,8 +653,12 @@ def sql_to_dataframe(sql):
 # -----------------------------
 # LLM agent setup
 # -----------------------------
-tools = [scrape_url_to_dataframe]
+# Use the ChatOpenAI `chat_model` defined above.
 
+# Tools list for agent (LangChain tool decorator returns metadata for the LLM)
+tools = [scrape_url_to_dataframe]  # we only expose scraping as a tool; agent will still produce code
+
+# Prompt: instruct agent to call the tool and output JSON only
 agent_prompt = ChatPromptTemplate.from_messages([
     ("system", """You are a full-stack autonomous data analyst agent.
 
@@ -753,11 +679,6 @@ You must:
 5. When returning plots, always use `plot_to_base64()` to keep image sizes small.
 6. Make sure all variables are defined before use, and the code can run without any undefined references.
 7) If image files are provided, DO NOT call any OCR libraries in Python. Rely on the model’s visual inspection to extract text from images.
-8) If a database file is provided, you may call:
-   - list_tables() -> list of table names
-   - read_table(table_name, limit=None) -> pandas.DataFrame
-   - sql_to_dataframe(sql) -> pandas.DataFrame
-   Use SQL where appropriate and cast numeric columns before stats/plots.
 """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -765,7 +686,7 @@ You must:
 
 tool_agent = create_tool_calling_agent(
     llm=chat_model,
-    tools=[scrape_url_to_dataframe],
+    tools=[scrape_url_to_dataframe],  # let the agent call tools if it wants; we will also pre-process scrapes
     prompt=agent_prompt
 )
 
@@ -784,6 +705,12 @@ agent_runner = AgentExecutor(
 # Runner: orchestrates agent -> pre-scrape inject -> execute
 # -----------------------------
 def run_agent_safely(llm_input: str) -> Dict:
+    """
+    1. Run the agent_executor.invoke to get LLM output
+    2. Extract JSON, get 'code' and 'questions'
+    3. Detect scrape_url_to_dataframe("...") calls in code, run them here, pickle df and inject before exec
+    4. Execute the code in a temp file and return results mapping questions -> answers
+    """
     try:
         log.info("Invoking agent with input length=%d", len(llm_input or ""))
         agent_reply = agent_runner.invoke({"input": llm_input}, {"timeout": LLM_TIMEOUT_SECONDS})
@@ -802,23 +729,30 @@ def run_agent_safely(llm_input: str) -> Dict:
         gen_code = parsed_out["code"]
         question_list: List[str] = parsed_out["questions"]
 
+        # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
         url_list = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", gen_code)
         pickle_file = None
         if url_list:
+            # For now support only the first URL (agent may code multiple scrapes; you can extend this)
             first_url = url_list[0]
             scrape_out = scrape_url_to_dataframe(first_url)
             if scrape_out.get("status") != "success":
                 return {"error": f"Scrape tool failed: {scrape_out.get('message')}"}
+            # create df and pickle it
             frame = pd.DataFrame(scrape_out["data"])
             tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             tmp_pkl.close()
             frame.to_pickle(tmp_pkl.name)
             pickle_file = tmp_pkl.name
 
+        # Execute code in temp python script
         exec_out = write_and_run_temp_python(gen_code, injected_pickle=pickle_file, timeout=LLM_TIMEOUT_SECONDS)
         if exec_out.get("status") != "success":
             return {"error": f"Execution failed: {exec_out.get('message', exec_out)}", "raw": exec_out.get("raw")}
+
+        # exec_out['result'] should be results dict
         result_map = exec_out.get("result", {})
+        # Map to original questions (they asked to use exact question strings)
         final_map = {}
         for qtext in question_list:
             final_map[qtext] = result_map.get(qtext, "Answer not found")
@@ -841,11 +775,12 @@ async def analyze_data(request: Request):
         qfile = None
         dfile = None
 
+        # Collect image data URIs for LLM vision
         image_data_uris = []
         image_filenames = []
 
         for key, v in formdata.items():
-            if hasattr(v, "filename") and v.filename:
+            if hasattr(v, "filename") and v.filename:  # it's a file
                 fname_lower = v.filename.lower()
                 if fname_lower.endswith(".txt") and qfile is None:
                     qfile = v
@@ -861,10 +796,6 @@ async def analyze_data(request: Request):
         pickle_file = None
         df_head_text = ""
         has_dataset = False
-
-        # DB wiring (path + backend) to pass into sandbox
-        db_tmp_path = None
-        db_backend = None
 
         if dfile:
             has_dataset = True
@@ -884,49 +815,47 @@ async def analyze_data(request: Request):
                 except ValueError:
                     frame = pd.DataFrame(json.loads(file_bytes.decode("utf-8")))
             elif data_filename.endswith(".pdf"):
-                frame = pdf_bytes_to_dataframe(file_bytes)
-            elif data_filename.endswith((".db", ".sqlite", ".duckdb")):
-                # Prepare DB file on disk and detect backend
-                preview = db_bytes_preview_dataframe(file_bytes)
-                frame = preview["df"]
-                db_tmp_path = preview["path"]
-                db_backend = preview["meta"].get("backend") or ""
-            elif data_filename.endswith((".png", ".jpg", ".jpeg")):
+                # NEW: handle PDF uploads
+                frame, _pdf_info = extract_pdf_to_dataframe(file_bytes)
+            elif data_filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                # Keep both a tiny df (so exec path won't break) and a data URI for vision LLM
                 try:
                     if PIL_READY:
                         img = Image.open(BytesIO(file_bytes))
-                        img = img.convert("RGB")
+                        img = img.convert("RGB")  # ensure RGB format
                         frame = pd.DataFrame({"image": [img]})
                     else:
-                        raise HTTPException(400, "PIL not available for image processing")
+                        # even without PIL, keep a placeholder df
+                        frame = pd.DataFrame({"image_bytes_len": [len(file_bytes)]})
+                    # Also keep a data URI for LLM vision
+                    mime = "image/png" if data_filename.endswith(".png") else "image/jpeg"
+                    image_data_uris.append(_bytes_to_data_uri(file_bytes, mime=mime))
+                    image_filenames.append(dfile.filename)
                 except Exception as e:
                     raise HTTPException(400, f"Image processing failed: {str(e)}")
-                mime = "image/png" if data_filename.endswith(".png") else "image/jpeg"
-                image_data_uris.append(_bytes_to_data_uri(file_bytes, mime=mime))
-                image_filenames.append(dfile.filename)
             else:
                 raise HTTPException(400, f"Unsupported data file type: {data_filename}")
 
-            # Only pickle if we actually have a frame (non-DB image preview frame also allowed)
-            if 'frame' in locals() and isinstance(frame, pd.DataFrame):
-                tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
-                tmp_pkl.close()
-                frame.to_pickle(tmp_pkl.name)
-                pickle_file = tmp_pkl.name
+            # Pickle for injection
+            tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+            tmp_pkl.close()
+            frame.to_pickle(tmp_pkl.name)
+            pickle_file = tmp_pkl.name
 
+            if isinstance(frame, pd.DataFrame):
                 df_head_text = (
                     f"\n\nThe uploaded dataset has {len(frame)} rows and {len(frame.columns)} columns.\n"
                     f"Columns: {', '.join(frame.columns.astype(str))}\n"
                     f"First rows:\n{frame.head(5).to_markdown(index=False)}\n"
                 )
 
-        # Build rules
+        # Build rules based on data presence
         if has_dataset:
             rules_text = (
                 "Rules:\n"
-                "1) You have access to a pandas DataFrame called `df` (if present via preview) and its dictionary form `data`.\n"
-                "2) DO NOT call scrape_url_to_dataframe() or fetch any external data when an uploaded dataset/DB is provided.\n"
-                "3) Use only the uploaded content for answering questions.\n"
+                "1) You have access to a pandas DataFrame called `df` and its dictionary form `data`.\n"
+                "2) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
+                "3) Use only the uploaded dataset for answering questions.\n"
                 "4) Produce a final JSON object with keys:\n"
                 '   - "questions": [ ... original question strings ... ]\n'
                 '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
@@ -942,50 +871,31 @@ async def analyze_data(request: Request):
                 "3) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
             )
 
-        if db_tmp_path and db_backend:
-            rules_text += (
-                "6) A database is uploaded. Use these helpers:\n"
-                "   - list_tables() -> list table names\n"
-                "   - read_table(table_name, limit=None) -> pandas.DataFrame\n"
-                "   - sql_to_dataframe(sql) -> pandas.DataFrame\n"
-                "   Prefer SQL for filtering/aggregation; cast numerics before math.\n"
-            )
-
-        if image_data_uris:
-            rules_text += (
-                "7) If image files are provided, DO NOT call any OCR libraries in Python. "
-                "Rely on the model’s visual inspection to extract text from images.\n"
-            )
-
         prompt_text = (
             f"{rules_text}\nQuestions:\n{qs_text}\n"
             f"{df_head_text if df_head_text else ''}"
             "Respond with the JSON object only."
         )
 
+        # If images are present, route to vision-based extraction (no Python OCR)
         if image_data_uris:
-            prompt_text += (
-                "\nAdditional rules for images:\n"
-                "- You have access to the uploaded images directly in this message.\n"
-                "- Do NOT attempt to use Python OCR libraries (not available).\n"
-                "- Extract text by visually inspecting the images.\n"
-                "- Return only JSON in the requested shape."
+            prompt_with_images = (
+                prompt_text
+                + "\nAdditional rules for images:\n"
+                  "- You have access to the uploaded images directly in this message.\n"
+                  "- Do NOT attempt to use Python OCR libraries (not available).\n"
+                  "- Extract text by visually inspecting the images.\n"
+                  "- Return only JSON in the requested shape."
             )
-            vision_result = run_vision_extraction(prompt_text, image_data_uris)
+            vision_result = run_vision_extraction(prompt_with_images, image_data_uris)
             if "error" in vision_result:
                 raise HTTPException(500, detail=f"Vision extraction failed: {vision_result['error']}")
             return JSONResponse(content=vision_result)
 
-        # Run agent (with DB helpers if present)
+        # Run agent
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(
-                run_agent_safely_unified,
-                prompt_text,
-                pickle_file,
-                db_tmp_path,
-                db_backend
-            )
+            future = pool.submit(run_agent_safely_unified, prompt_text, pickle_file)
             try:
                 result_payload = future.result(timeout=LLM_TIMEOUT_SECONDS)
             except concurrent.futures.TimeoutError:
@@ -1004,6 +914,7 @@ async def analyze_data(request: Request):
                     try:
                         v = result_payload[qtxt]
                         if isinstance(v, str) and v.startswith("data:image/"):
+                            # Remove data URI prefix
                             v = v.split(",", 1)[1] if "," in v else v
                         projected[k] = to_type(v) if v not in (None, "") else v
                     except Exception:
@@ -1019,14 +930,12 @@ async def analyze_data(request: Request):
         raise HTTPException(500, detail=str(e))
 
 
-def run_agent_safely_unified(llm_input: str, pickle_path: str = None,
-                             db_path: str = None, db_backend: str = None) -> Dict:
+def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     """
     Runs the LLM agent and executes code.
     - Retries up to 3 times if agent returns no output.
     - If pickle_path is provided, injects that DataFrame directly.
     - If no pickle_path, falls back to scraping when needed.
-    - If db_path is provided, exposes DB helpers to the sandbox.
     """
     try:
         attempt_limit = 3
@@ -1063,13 +972,7 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None,
                 frame.to_pickle(tmp_pkl.name)
                 pickle_path = tmp_pkl.name
 
-        exec_out = write_and_run_temp_python(
-            gen_code,
-            injected_pickle=pickle_path,
-            timeout=LLM_TIMEOUT_SECONDS,
-            injected_db_path=db_path,
-            injected_db_backend=db_backend
-        )
+        exec_out = write_and_run_temp_python(gen_code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
         if exec_out.get("status") != "success":
             return {"error": f"Execution failed: {exec_out.get('message')}", "raw": exec_out.get("raw")}
 
@@ -1114,6 +1017,7 @@ async def analyze_get_info():
 # -----------------------------
 # System Diagnostics
 # -----------------------------
+# ---- Add these imports near other imports at top of app.py ----
 import asyncio
 import httpx
 import importlib.metadata
@@ -1131,6 +1035,7 @@ import time
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse    
 
+# ---- Configuration for diagnostics (tweak as needed) ----
 DIAG_NETWORK_TARGETS = {
     "Google AI": "https://generativelanguage.googleapis.com",
     "AISTUDIO": "https://aistudio.google.com/",
@@ -1138,13 +1043,15 @@ DIAG_NETWORK_TARGETS = {
     "AI Pipe (OpenAI)": "https://aipipe.org/openai/v1/models",
     "GitHub": "https://api.github.com",
 }
-DIAG_LLM_KEY_TIMEOUT = 30
-DIAG_PARALLELISM = 6
-RUN_LONGER_CHECKS = False
+DIAG_LLM_KEY_TIMEOUT = 30  # seconds per key/model simple ping test (sync tests run in threadpool)
+DIAG_PARALLELISM = 6       # how many thread workers for sync checks
+RUN_LONGER_CHECKS = False  # Playwright/duckdb tests run only if true (they can be slow)
 
+# helper: iso timestamp
 def _now_iso():
     return datetime.utcnow().isoformat() + "Z"
 
+# helper: run sync func in threadpool and return result / exception info
 _executor = ThreadPoolExecutor(max_workers=DIAG_PARALLELISM)
 async def run_in_thread(fn, *a, timeout=30, **kw):
     loop = asyncio.get_running_loop()
@@ -1154,13 +1061,16 @@ async def run_in_thread(fn, *a, timeout=30, **kw):
     except asyncio.TimeoutError:
         raise TimeoutError("timeout")
     except Exception as e:
+        # re-raise for caller to capture stacktrace easily
         raise
 
+# ---- Diagnostic check functions (safely return dicts) ----
 def _env_check(required=None):
     required = required or []
     state = {}
     for k in required:
         state[k] = {"present": bool(os.getenv(k)), "masked": (os.getenv(k)[:4] + "..." + os.getenv(k)[-4:]) if os.getenv(k) else None}
+    # Also include simple helpful values
     state["GOOGLE_MODEL"] = os.getenv("GOOGLE_MODEL")
     state["LLM_TIMEOUT_SECONDS"] = os.getenv("LLM_TIMEOUT_SECONDS")
     state["OPENAI_BASE_URL"] = os.getenv("OPENAI_BASE_URL")
@@ -1175,6 +1085,7 @@ def _system_info():
         "cpu_logical_cores": psutil.cpu_count(logical=True),
         "memory_total_gb": round(psutil.virtual_memory().total / 1024**3, 2),
     }
+    # disk free for app dir and tmp
     try:
         _cwd = os.getcwd()
         info["cwd_free_gb"] = round(shutil.disk_usage(_cwd).free / 1024**3, 2)
@@ -1184,6 +1095,7 @@ def _system_info():
         info["tmp_free_gb"] = round(shutil.disk_usage(tempfile.gettempdir()).free / 1024**3, 2)
     except Exception:
         info["tmp_free_gb"] = None
+    # GPU quick probe (if torch installed)
     try:
         import torch
         info["torch_installed"] = True
@@ -1205,6 +1117,7 @@ def _temp_write_test():
     return {"tmp_dir": tmp, "write_ok": ok}
 
 def _app_write_test():
+    # try writing into current working directory
     cwd = os.getcwd()
     path = os.path.join(cwd, f"diag_test_{int(time.time())}.tmp")
     with open(path, "w") as f:
@@ -1221,6 +1134,7 @@ def _pandas_pipeline_test():
     return {"rows": df.shape[0], "cols": df.shape[1], "z_sum": int(agg)}
 
 def _installed_packages_sample():
+    # return top 20 installed package names + versions
     try:
         out = []
         for dist in importlib.metadata.distributions():
@@ -1236,12 +1150,14 @@ def _installed_packages_sample():
         return {"error": str(e)}
 
 def _network_probe_sync(url, timeout=30):
+    # synchronous network probe for threadpool use
     try:
         r = requests.head(url, timeout=timeout)
         return {"ok": True, "status_code": r.status_code, "latency_ms": int(r.elapsed.total_seconds()*1000)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---- LLM key/model light test (AI Pipe/OpenAI) ----
 def _test_openai_aipipe_models(api_key: str, base_url: str):
     try:
         url = base_url.rstrip("/") + "/models"
@@ -1250,6 +1166,7 @@ def _test_openai_aipipe_models(api_key: str, base_url: str):
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
+# ---- Async wrappers that call the sync checks in threadpool ----
 async def check_network():
     coros = []
     for name, url in DIAG_NETWORK_TARGETS.items():
@@ -1264,10 +1181,12 @@ async def check_network():
     return out
 
 async def check_llm_keys_models():
+    """Check AI Pipe/OpenAI list-models endpoint with provided token."""
     if not OPENAI_API_KEY:
         return {"warning": "no OPENAI_API_KEY configured"}
     return await run_in_thread(_test_openai_aipipe_models, OPENAI_API_KEY, OPENAI_BASE_URL, timeout=10)
 
+# ---- Optional slow heavy checks (DuckDB, Playwright) ----
 async def check_duckdb():
     try:
         import duckdb
@@ -1293,6 +1212,7 @@ async def check_playwright():
     except Exception as e:
         return {"playwright_error": str(e)}
 
+# ---- Final /diagnose route (concurrent) ----
 from fastapi import Query
 
 @app.get("/summary")
@@ -1306,6 +1226,7 @@ async def diagnose(full: bool = Query(False, description="If true, run extended 
         "elapsed_seconds": None
     }
 
+    # prepare tasks
     tasks = {
         "env": run_in_thread(_env_check, ["GOOGLE_API_KEY", "GOOGLE_MODEL", "LLM_TIMEOUT_SECONDS", "OPENAI_BASE_URL"], timeout=3),
         "system": run_in_thread(_system_info, timeout=30),
@@ -1321,6 +1242,7 @@ async def diagnose(full: bool = Query(False, description="If true, run extended 
         tasks["duckdb"] = asyncio.create_task(check_duckdb())
         tasks["playwright"] = asyncio.create_task(check_playwright())
 
+    # run all concurrently, collect results
     results = {}
     for name, coro in tasks.items():
         try:
@@ -1332,9 +1254,16 @@ async def diagnose(full: bool = Query(False, description="If true, run extended 
             results[name] = {"status": "error", "error": str(e), "trace": traceback.format_exc()}
 
     report["checks"] = results
+
+    # quick summary flags
     failed = [k for k, v in results.items() if v.get("status") != "ok"]
-    report["status"] = "warning" if failed else "ok"
-    report["summary"]["failed_checks"] = failed if failed else []
+    if failed:
+        report["status"] = "warning"
+        report["summary"]["failed_checks"] = failed
+    else:
+        report["status"] = "ok"
+        report["summary"]["failed_checks"] = []
+
     report["elapsed_seconds"] = (datetime.utcnow() - started).total_seconds()
     return report
 
