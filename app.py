@@ -449,6 +449,25 @@ def _bytes_to_data_uri(img_bytes: bytes, mime="image/png") -> str:
     b64 = base64.b64encode(img_bytes).decode("ascii")
     return f"data:{mime};base64,{b64}"
 
+# ---------- NEW: normalization & numeric coercion helpers ----------
+def _normalize_columns_inplace(df: pd.DataFrame):
+    df.columns = (
+        pd.Index(df.columns)
+        .map(str)
+        .map(lambda s: s.replace("\xa0", " ").strip())
+        .map(lambda s: re.sub(r"\s+", "_", s.lower()))
+        .map(lambda s: re.sub(r"[^0-9a-z_]", "", s))
+    )
+
+def _coerce_numeric_columns_inplace(df: pd.DataFrame):
+    for c in list(df.columns):
+        if df[c].dtype == object:
+            s = df[c].astype(str)
+            s2 = s.str.replace(r"[,$%]", "", regex=True).str.replace(r"\s", "", regex=True)
+            coerced = pd.to_numeric(s2, errors="coerce")
+            if coerced.notna().sum() >= max(3, int(0.5 * len(df))):
+                df[c] = coerced
+
 def run_vision_extraction(questions_text: str, image_uris: List[str]) -> Dict:
     """
     Send images + instructions to a vision-capable LLM and expect JSON-only output.
@@ -548,7 +567,7 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
     """
     # create file content
     bootstrap_lines = [
-        "import json, sys, gc, types, re",
+        "import json, sys, gc, types, re, math",
         "import pandas as pd, numpy as np",
         "import matplotlib",
         "matplotlib.use('Agg')",
@@ -560,40 +579,117 @@ def write_and_run_temp_python(code: str, injected_pickle: str = None, timeout: i
     ]
     if PIL_READY:
         bootstrap_lines.append("from PIL import Image")
-    # NEW: loader that can handle dict payloads (tables) or a single df
+    # NEW: loader that can handle dict payloads (tables) or a single df and expose helpers/short names
     if injected_pickle:
         bootstrap_lines.append(f"_payload = pd.read_pickle(r'''{injected_pickle}''')\n")
         bootstrap_lines.append("tables = {}\n")
         bootstrap_lines.append("df = None\n")
         bootstrap_lines.append("data = {}\n")
         bootstrap_lines.append(
+            "def _sanitize(name):\n"
+            "    name = re.sub(r'[^0-9a-zA-Z_]+', '_', str(name))\n"
+            "    if name and name[0].isdigit():\n"
+            "        name = '_' + name\n"
+            "    return name\n"
+        )
+        # helpers
+        bootstrap_lines.append(
+            "def find_column(df, candidates):\n"
+            "    cols = [c for c in df.columns]\n"
+            "    lower = {c.lower(): c for c in cols}\n"
+            "    for cand in candidates:\n"
+            "        k = str(cand).lower().strip()\n"
+            "        if k in lower:\n"
+            "            return lower[k]\n"
+            "    # fuzzy contains\n"
+            "    for cand in candidates:\n"
+            "        k = str(cand).lower().strip()\n"
+            "        for c in cols:\n"
+            "            if k in c.lower():\n"
+            "                return c\n"
+            "    return None\n"
+        )
+        bootstrap_lines.append(
+            "def smart_to_numeric(s):\n"
+            "    s = s.astype(str).str.replace(r'[,$%]', '', regex=True).str.replace(r'\\s','', regex=True)\n"
+            "    return pd.to_numeric(s, errors='coerce')\n"
+        )
+        bootstrap_lines.append(
+            "def coerce_numeric_columns(df):\n"
+            "    for c in list(df.columns):\n"
+            "        if df[c].dtype == object:\n"
+            "            coerced = smart_to_numeric(df[c])\n"
+            "            if coerced.notna().sum() >= max(3, int(0.5*len(df))):\n"
+            "                df[c] = coerced\n"
+        )
+        bootstrap_lines.append(
+            "def safe_scatter_with_trend(df, x_candidates, y_candidates, title=''):\n"
+            "    xcol = find_column(df, x_candidates)\n"
+            "    ycol = find_column(df, y_candidates)\n"
+            "    if not xcol or not ycol:\n"
+            "        plt.figure(); plt.text(0.5,0.5,'Columns not found',ha='center');\n"
+            "        return\n"
+            "    coerce_numeric_columns(df)\n"
+            "    x = df[xcol]\n"
+            "    y = df[ycol]\n"
+            "    mask = x.notna() & y.notna()\n"
+            "    x = x[mask]; y = y[mask]\n"
+            "    plt.figure()\n"
+            "    if len(x) < 2:\n"
+            "        plt.text(0.5,0.5,'Not enough data to plot',ha='center'); plt.xlabel(xcol); plt.ylabel(ycol); plt.title(title); return\n"
+            "    plt.scatter(x, y)\n"
+            "    # trend line\n"
+            "    try:\n"
+            "        coeffs = np.polyfit(x, y, 1)\n"
+            "        xx = np.linspace(float(np.nanmin(x)), float(np.nanmax(x)), 50)\n"
+            "        yy = coeffs[0]*xx + coeffs[1]\n"
+            "        plt.plot(xx, yy, 'r:', linewidth=2)\n"
+            "    except Exception:\n"
+            "        pass\n"
+            "    plt.xlabel(xcol); plt.ylabel(ycol); plt.title(title)\n"
+        )
+        bootstrap_lines.append(
+            "def get_table(name):\n"
+            "    # smart lookup in tables by exact key, by short key, or fuzzy\n"
+            "    if name in tables: return tables[name]\n"
+            "    key = name.lower().strip()\n"
+            "    # exact on lower\n"
+            "    for k in tables:\n"
+            "        if k.lower() == key: return tables[k]\n"
+            "    # contains\n"
+            "    for k in tables:\n"
+            "        if key in k.lower(): return tables[k]\n"
+            "    return None\n"
+        )
+        bootstrap_lines.append(
             "if isinstance(_payload, dict):\n"
-            "    # Preferred keys: '__df__', '__tables__'\n"
             "    df = _payload.get('__df__')\n"
             "    tables = _payload.get('__tables__', {}) or {}\n"
-            "    # Expose convenience variables: <table>_df\n"
-            "    def _sanitize(name):\n"
-            "        name = re.sub(r'[^0-9a-zA-Z_]+', '_', str(name))\n"
-            "        if name and name[0].isdigit():\n"
-            "            name = '_' + name\n"
-            "        return name\n"
+            "    # expose convenience variables: full key and short key\n"
             "    for _tname, _tdf in list(tables.items()):\n"
             "        try:\n"
             "            globals()[f'{_sanitize(_tname)}_df'] = _tdf\n"
+            "            _short = _tname.split('::')[-1]\n"
+            "            globals()[f'{_sanitize(_short)}_df'] = _tdf\n"
             "        except Exception:\n"
             "            pass\n"
             "    if df is None and tables:\n"
-            "        # choose largest table as df\n"
             "        df = max(tables.values(), key=lambda d: (len(d) * max(1, len(d.columns))))\n"
             "else:\n"
             "    df = _payload\n"
         )
-        bootstrap_lines.append("if isinstance(df, pd.DataFrame):\n    data = df.to_dict(orient='records')\n")
+        bootstrap_lines.append("if isinstance(df, pd.DataFrame):\n    data = df.to_dict(orient='records')\nelse:\n    data = {}\n")
+        bootstrap_lines.append("all_tables = list(tables.keys())\n")
     else:
         # ensure data exists so user code that references data won't break
         bootstrap_lines.append("tables = {}\n")
         bootstrap_lines.append("df = None\n")
         bootstrap_lines.append("data = {}\n")
+        bootstrap_lines.append("def find_column(df, candidates):\n    return None\n")
+        bootstrap_lines.append("def smart_to_numeric(s):\n    return pd.to_numeric(s, errors='coerce')\n")
+        bootstrap_lines.append("def coerce_numeric_columns(df):\n    pass\n")
+        bootstrap_lines.append("def safe_scatter_with_trend(df, x_candidates, y_candidates, title=''):\n    plt.figure(); plt.text(0.5,0.5,'No data',ha='center')\n")
+        bootstrap_lines.append("def get_table(name):\n    return None\n")
 
     # plot_to_base64 helper that tries to reduce size under 100_000 bytes
     plot_helper = r'''
@@ -707,10 +803,12 @@ You must:
 4. Your Python code will run in a sandbox with:
    - pandas, numpy, matplotlib available
    - A helper function `plot_to_base64(max_bytes=100000)` for generating base64-encoded images under 100KB.
-5. When returning plots, always use `plot_to_base64()` to keep image sizes small.
+   - Helpers available: `find_column`, `smart_to_numeric`, `coerce_numeric_columns`, `safe_scatter_with_trend`, and `get_table`.
+5. When returning plots, prefer `safe_scatter_with_trend(...)` for scatter + dotted red regression when appropriate.
 6. Make sure all variables are defined before use, and the code can run without any undefined references.
 7) If image files are provided, DO NOT call any OCR libraries in Python. Rely on the model’s visual inspection to extract text from images.
-8) If a database was uploaded, access its tables via the dict `tables` (pandas DataFrames keyed by table name). Convenience variables like `<table_name>_df` are also available. The largest table is bound to `df` for quick inspection.
+8) If a database was uploaded, access its tables via the dict `tables` (pandas DataFrames keyed by table name). Convenience variables like `<table_name>_df` are also available (both the sanitized full name and the short name after '::'). The largest table is bound to `df` for quick inspection.
+9) If data is insufficient for a numeric answer or a plot, still populate an informative string in `results` explaining why (e.g., "no matching rows" or "columns not found").
 """),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -805,7 +903,7 @@ async def analyze_data(request: Request):
     try:
         formdata = await request.form()
         qfile = None
-        # NEW: collect all non-.txt uploads
+        # collect all non-.txt uploads
         other_files: List[UploadFile] = []
 
         # Collect image data URIs for LLM vision
@@ -826,17 +924,19 @@ async def analyze_data(request: Request):
         qs_text = (await qfile.read()).decode("utf-8")
         ordered_keys, cast_lookup = parse_keys_and_types(qs_text)
 
-        # NEW: prefetch any URLs mentioned in questions.txt and treat as dataset
+        # prefetch any URLs mentioned in questions.txt and treat as dataset
         url_regex = r"https?://[^\s)]+"
         urls_in_q = re.findall(url_regex, qs_text) or []
 
-        # NEW: collect all tabular frames and a tables dict (for DBs etc.)
+        # collect all tabular frames and a tables dict (for DBs etc.)
         tabular_frames: List[pd.DataFrame] = []
         tables_dict: Dict[str, pd.DataFrame] = {}
 
         def _add_frame(df: pd.DataFrame, source: str):
             if isinstance(df, pd.DataFrame):
                 df = df.copy()
+                _normalize_columns_inplace(df)
+                _coerce_numeric_columns_inplace(df)
                 df["source_file"] = source
                 tabular_frames.append(df)
 
@@ -861,6 +961,15 @@ async def analyze_data(request: Request):
                     for sheet in xls.sheet_names:
                         df_sheet = xls.parse(sheet)
                         _add_frame(df_sheet, f"{data_filename}::{sheet}")
+                        # also register per-sheet in tables
+                        key = f"{os.path.basename(data_filename)}::{sheet}"
+                        tdf = df_sheet.copy()
+                        _normalize_columns_inplace(tdf); _coerce_numeric_columns_inplace(tdf)
+                        tables_dict[key] = tdf
+                        short = sheet
+                        short_key = short.lower()
+                        if short_key not in tables_dict:
+                            tables_dict[short] = tdf
                 except Exception:
                     bio.seek(0)
                     frame = pd.read_excel(bio)
@@ -904,9 +1013,14 @@ async def analyze_data(request: Request):
                     tbl_names = [t[0] for t in tbls if t and t[0]]
                     for tname in tbl_names:
                         df_tbl = pd.read_sql_query(f"SELECT * FROM [{tname}]", conn)
-                        key = f"{os.path.basename(data_filename)}::{tname}"
-                        tables_dict[key] = df_tbl
-                        _add_frame(df_tbl, key)
+                        _normalize_columns_inplace(df_tbl); _coerce_numeric_columns_inplace(df_tbl)
+                        long_key = f"{os.path.basename(data_filename)}::{tname}"
+                        tables_dict[long_key] = df_tbl
+                        short = tname
+                        # also expose short key (lower) if unique
+                        if short not in tables_dict:
+                            tables_dict[short] = df_tbl
+                        _add_frame(df_tbl, long_key)
                     conn.close()
                 except Exception as e:
                     log.warning("DB load failed for %s: %s", data_filename, e)
@@ -925,6 +1039,7 @@ async def analyze_data(request: Request):
                 tool_resp = scrape_url_to_dataframe(u)
                 if tool_resp.get("status") == "success":
                     df_url = pd.DataFrame(tool_resp["data"])
+                    _normalize_columns_inplace(df_url); _coerce_numeric_columns_inplace(df_url)
                     _add_frame(df_url, u)
                 else:
                     log.warning("Prefetch failed for %s: %s", u, tool_resp.get("message"))
@@ -937,7 +1052,6 @@ async def analyze_data(request: Request):
             try:
                 merged_df = pd.concat(tabular_frames, ignore_index=True, sort=False)
             except Exception:
-                # safe fallback: align columns as strings then concat
                 tabular_frames2 = []
                 for dfi in tabular_frames:
                     dfx = dfi.copy()
@@ -952,8 +1066,6 @@ async def analyze_data(request: Request):
         df_head_text = ""
         has_dataset = bool(merged_df is not None)
 
-        # If images are present, we will route to vision path later, but still prepare payload.
-
         # Pickle for injection (even if df is None, we pass dict)
         temp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
         temp_pkl.close()
@@ -961,24 +1073,37 @@ async def analyze_data(request: Request):
         pickle_file = temp_pkl.name
 
         if isinstance(merged_df, pd.DataFrame):
+            # small per-table preview for prompt
+            table_summaries = []
+            for k, tdf in list(tables_dict.items())[:12]:  # cap summary
+                try:
+                    cols = ", ".join(map(str, list(tdf.columns)[:10]))
+                    table_summaries.append(f"- {k}: cols=[{cols}] rows={len(tdf)}")
+                except Exception:
+                    continue
+            tables_preview_text = "Available tables:\n" + ("\n".join(table_summaries) if table_summaries else "None")
             df_head_text = (
                 f"\n\nThe stitched dataset has {len(merged_df)} rows and {len(merged_df.columns)} columns.\n"
                 f"Columns: {', '.join(merged_df.columns.astype(str))}\n"
-                f"First rows:\n{merged_df.head(5).to_markdown(index=False)}\n"
+                f"{tables_preview_text}\n"
+                f"First rows (stitched df):\n{merged_df.head(5).to_markdown(index=False)}\n"
             )
+        else:
+            tables_preview_text = "No stitched df. " + ("Available tables:\n" + "\n".join([f"- {k}" for k in list(tables_dict.keys())[:12]]) if tables_dict else "No tables.")
 
         # Build rules based on data presence
-        if has_dataset:
+        if has_dataset or tables_dict:
             rules_text = (
                 "Rules:\n"
                 "1) You have access to a pandas DataFrame called `df` (stitched from all provided tabular sources and URLs) and its dictionary form `data`.\n"
-                "2) A dict `tables` provides per-table DataFrames (e.g., from .db and multi-sheet Excel). Convenience variables `<table_name>_df` are also available.\n"
+                "2) A dict `tables` provides per-table DataFrames (e.g., from .db and multi-sheet Excel). Convenience variables `<table_name>_df` are also available (both full and short names).\n"
                 "3) DO NOT call scrape_url_to_dataframe() or fetch any external data.\n"
                 "4) Use only the uploaded/stitched dataset(s) for answering questions.\n"
                 "5) Produce a final JSON object with keys:\n"
                 '   - "questions": [ ... original question strings ... ]\n'
                 '   - "code": "..."  (Python code that fills `results` with exact question strings as keys)\n'
-                "6) For plots: use plot_to_base64() helper to return base64 image data under 100kB.\n"
+                "6) For plots: use plot_to_base64() helper to return base64 image data under 100kB. Prefer safe_scatter_with_trend when plotting scatter.\n"
+                "7) If a requested chart would be empty due to no data, still generate a figure that explains why (e.g., annotate message) so evaluators don't see a blank plot.\n"
             )
         else:
             rules_text = (
@@ -992,7 +1117,7 @@ async def analyze_data(request: Request):
 
         prompt_text = (
             f"{rules_text}\nQuestions:\n{qs_text}\n"
-            f"{df_head_text if df_head_text else ''}"
+            f"{df_head_text if df_head_text else tables_preview_text}\n"
             "Respond with the JSON object only."
         )
 
