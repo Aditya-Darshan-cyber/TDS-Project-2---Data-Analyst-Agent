@@ -729,20 +729,26 @@ def run_agent_safely(llm_input: str) -> Dict:
         gen_code = parsed_out["code"]
         question_list: List[str] = parsed_out["questions"]
 
-        # Detect scrape calls; find all URLs used in scrape_url_to_dataframe("URL")
+        # Detect ALL scrape calls and prefetch each, stitch with source_url
         url_list = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", gen_code)
         pickle_file = None
         if url_list:
-            # For now support only the first URL (agent may code multiple scrapes; you can extend this)
-            first_url = url_list[0]
-            scrape_out = scrape_url_to_dataframe(first_url)
-            if scrape_out.get("status") != "success":
-                return {"error": f"Scrape tool failed: {scrape_out.get('message')}"}
-            # create df and pickle it
-            frame = pd.DataFrame(scrape_out["data"])
+            fetched_frames = []
+            for u in url_list:
+                tool_resp = scrape_url_to_dataframe(u)
+                if tool_resp.get("status") != "success":
+                    return {"error": f"Scrape tool failed: {tool_resp.get('message') or 'unknown'} for URL: {u}"}
+                df_u = pd.DataFrame(tool_resp["data"])
+                if not df_u.empty:
+                    df_u["source_url"] = u
+                fetched_frames.append(df_u)
+            if fetched_frames:
+                combined = pd.concat(fetched_frames, ignore_index=True, sort=False)
+            else:
+                combined = pd.DataFrame()
             tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             tmp_pkl.close()
-            frame.to_pickle(tmp_pkl.name)
+            combined.to_pickle(tmp_pkl.name)
             pickle_file = tmp_pkl.name
 
         # Execute code in temp python script
@@ -773,19 +779,21 @@ async def analyze_data(request: Request):
     try:
         formdata = await request.form()
         qfile = None
-        dfile = None
+        # NEW: collect all non-.txt uploads
+        data_files: List[UploadFile] = []
 
-        # Collect image data URIs for LLM vision
-        image_data_uris = []
-        image_filenames = []
+        # Collect image data URIs for LLM vision (now supports multiple)
+        image_data_uris: List[str] = []
+        image_filenames: List[str] = []
 
-        for key, v in formdata.items():
-            if hasattr(v, "filename") and v.filename:  # it's a file
+        # IMPORTANT: use multi_items() to see every file entry
+        for key, v in formdata.multi_items():
+            if hasattr(v, "filename") and v.filename:
                 fname_lower = v.filename.lower()
                 if fname_lower.endswith(".txt") and qfile is None:
                     qfile = v
                 else:
-                    dfile = v
+                    data_files.append(v)
 
         if not qfile:
             raise HTTPException(400, "Missing questions file (.txt)")
@@ -795,61 +803,87 @@ async def analyze_data(request: Request):
 
         pickle_file = None
         df_head_text = ""
-        has_dataset = False
+        frames: List[pd.DataFrame] = []
 
-        if dfile:
-            has_dataset = True
-            data_filename = dfile.filename.lower()
-            file_bytes = await dfile.read()
+        # NEW: process ALL uploaded files
+        for up in data_files:
+            data_filename = up.filename
+            lower = data_filename.lower()
+            file_bytes = await up.read()
             from io import BytesIO
 
-            if data_filename.endswith(".csv"):
-                frame = pd.read_csv(BytesIO(file_bytes))
-            elif data_filename.endswith((".xlsx", ".xls")):
-                frame = pd.read_excel(BytesIO(file_bytes))
-            elif data_filename.endswith(".parquet"):
-                frame = pd.read_parquet(BytesIO(file_bytes))
-            elif data_filename.endswith(".json"):
+            if lower.endswith(".csv"):
+                df = pd.read_csv(BytesIO(file_bytes))
+                df["source_file"] = data_filename
+                frames.append(df)
+
+            elif lower.endswith((".xlsx", ".xls")):
+                df = pd.read_excel(BytesIO(file_bytes))
+                df["source_file"] = data_filename
+                frames.append(df)
+
+            elif lower.endswith(".parquet"):
+                df = pd.read_parquet(BytesIO(file_bytes))
+                df["source_file"] = data_filename
+                frames.append(df)
+
+            elif lower.endswith(".json"):
                 try:
-                    frame = pd.read_json(BytesIO(file_bytes))
+                    df = pd.read_json(BytesIO(file_bytes))
                 except ValueError:
-                    frame = pd.DataFrame(json.loads(file_bytes.decode("utf-8")))
-            elif data_filename.endswith(".pdf"):
-                # NEW: handle PDF uploads
-                frame, _pdf_info = extract_pdf_to_dataframe(file_bytes)
-            elif data_filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
-                # Keep both a tiny df (so exec path won't break) and a data URI for vision LLM
+                    df = pd.DataFrame(json.loads(file_bytes.decode("utf-8")))
+                df["source_file"] = data_filename
+                frames.append(df)
+
+            elif lower.endswith(".pdf"):
+                df_pdf, _pdf_info = extract_pdf_to_dataframe(file_bytes)
+                # Always tag source; table or text will be merged
+                df_pdf["source_file"] = data_filename
+                frames.append(df_pdf)
+
+            elif lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+                # Keep a tiny df (so exec path won't break) AND a data URI for vision LLM
                 try:
                     if PIL_READY:
                         img = Image.open(BytesIO(file_bytes))
-                        img = img.convert("RGB")  # ensure RGB format
-                        frame = pd.DataFrame({"image": [img]})
+                        img = img.convert("RGB")
+                        df_img = pd.DataFrame({"image": [f"{data_filename}"], "image_bytes_len": [len(file_bytes)]})
                     else:
-                        # even without PIL, keep a placeholder df
-                        frame = pd.DataFrame({"image_bytes_len": [len(file_bytes)]})
-                    # Also keep a data URI for LLM vision
-                    mime = "image/png" if data_filename.endswith(".png") else "image/jpeg"
-                    image_data_uris.append(_bytes_to_data_uri(file_bytes, mime=mime))
-                    image_filenames.append(dfile.filename)
+                        df_img = pd.DataFrame({"image": [f"{data_filename}"], "image_bytes_len": [len(file_bytes)]})
+                    df_img["source_file"] = data_filename
+                    frames.append(df_img)
                 except Exception as e:
                     raise HTTPException(400, f"Image processing failed: {str(e)}")
-            else:
-                raise HTTPException(400, f"Unsupported data file type: {data_filename}")
+                # Collect *all* images for vision
+                mime = "image/png" if lower.endswith(".png") else "image/jpeg"
+                image_data_uris.append(_bytes_to_data_uri(file_bytes, mime=mime))
+                image_filenames.append(data_filename)
 
+            else:
+                # skip unknown binaries instead of failing entire request
+                # minimal change: keep behavior simple
+                continue
+
+        has_dataset = len(frames) > 0
+
+        # If we built any tabular/text frames, stitch them with source_file
+        if has_dataset:
+            merged_df = pd.concat(frames, ignore_index=True, sort=False) if len(frames) > 1 else frames[0]
             # Pickle for injection
             tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
             tmp_pkl.close()
-            frame.to_pickle(tmp_pkl.name)
+            merged_df.to_pickle(tmp_pkl.name)
             pickle_file = tmp_pkl.name
 
-            if isinstance(frame, pd.DataFrame):
+            if isinstance(merged_df, pd.DataFrame):
+                # Preview of merged DataFrame
                 df_head_text = (
-                    f"\n\nThe uploaded dataset has {len(frame)} rows and {len(frame.columns)} columns.\n"
-                    f"Columns: {', '.join(frame.columns.astype(str))}\n"
-                    f"First rows:\n{frame.head(5).to_markdown(index=False)}\n"
+                    f"\n\nThe uploaded dataset (merged) has {len(merged_df)} rows and {len(merged_df.columns)} columns.\n"
+                    f"Columns: {', '.join(merged_df.columns.astype(str))}\n"
+                    f"First rows:\n{merged_df.head(5).to_markdown(index=False)}\n"
                 )
 
-        # Build rules based on data presence
+        # Build rules based on data presence (unchanged)
         if has_dataset:
             rules_text = (
                 "Rules:\n"
@@ -877,8 +911,8 @@ async def analyze_data(request: Request):
             "Respond with the JSON object only."
         )
 
-        # If images are present, route to vision-based extraction (no Python OCR)
-        if image_data_uris:
+        # If ONLY images (and no tabular/text frames), route to vision path with ALL images
+        if image_data_uris and not has_dataset:
             prompt_with_images = (
                 prompt_text
                 + "\nAdditional rules for images:\n"
@@ -892,7 +926,7 @@ async def analyze_data(request: Request):
                 raise HTTPException(500, detail=f"Vision extraction failed: {vision_result['error']}")
             return JSONResponse(content=vision_result)
 
-        # Run agent
+        # Run agent (tabular/text path or no-attachment path)
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as pool:
             future = pool.submit(run_agent_safely_unified, prompt_text, pickle_file)
@@ -935,7 +969,7 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
     Runs the LLM agent and executes code.
     - Retries up to 3 times if agent returns no output.
     - If pickle_path is provided, injects that DataFrame directly.
-    - If no pickle_path, falls back to scraping when needed.
+    - If no pickle_path, prefetches ALL scrape_url_to_dataframe calls and stitches them.
     """
     try:
         attempt_limit = 3
@@ -959,17 +993,23 @@ def run_agent_safely_unified(llm_input: str, pickle_path: str = None) -> Dict:
         gen_code = parsed_out["code"]
         question_list = parsed_out["questions"]
 
+        # If we didn't inject an uploaded dataset, prefetch ALL scrape calls and combine
         if pickle_path is None:
             url_list = re.findall(r"scrape_url_to_dataframe\(\s*['\"](.*?)['\"]\s*\)", gen_code)
             if url_list:
-                target = url_list[0]
-                scrape_out = scrape_url_to_dataframe(target)
-                if scrape_out.get("status") != "success":
-                    return {"error": f"Scrape tool failed: {scrape_out.get('message')}"}
-                frame = pd.DataFrame(scrape_out["data"])
+                fetched_frames = []
+                for u in url_list:
+                    tool_resp = scrape_url_to_dataframe(u)
+                    if tool_resp.get("status") != "success":
+                        return {"error": f"Scrape tool failed: {tool_resp.get('message') or 'unknown'} for URL: {u}"}
+                    df_u = pd.DataFrame(tool_resp["data"])
+                    if not df_u.empty:
+                        df_u["source_url"] = u
+                    fetched_frames.append(df_u)
+                combined = pd.concat(fetched_frames, ignore_index=True, sort=False) if fetched_frames else pd.DataFrame()
                 tmp_pkl = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
                 tmp_pkl.close()
-                frame.to_pickle(tmp_pkl.name)
+                combined.to_pickle(tmp_pkl.name)
                 pickle_path = tmp_pkl.name
 
         exec_out = write_and_run_temp_python(gen_code, injected_pickle=pickle_path, timeout=LLM_TIMEOUT_SECONDS)
@@ -1010,7 +1050,7 @@ async def analyze_get_info():
     """Health/info endpoint. Use POST / (or /api) for actual analysis."""
     return JSONResponse({
         "ok": True,
-        "message": "Server is running. Use POST / or /api with 'questions_file' and optional 'data_file'.",
+        "message": "Server is running. Use POST / or /api with 'questions_file' and optional 'data_file(s)'.",
     })
 
 
